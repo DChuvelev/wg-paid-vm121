@@ -1,0 +1,14 @@
+[Unit]
+Description=WG Access host-side trigger watcher
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wg-access-trigger-watch.py
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

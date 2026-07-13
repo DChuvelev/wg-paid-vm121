@@ -1,0 +1,12 @@
+[Unit]
+Description=WG Access reconcile boot and safety timer
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=wg-access-reconcile.service
+
+[Install]
+WantedBy=timers.target

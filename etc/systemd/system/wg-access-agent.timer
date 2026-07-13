@@ -1,0 +1,11 @@
+[Unit]
+Description=Run WG Access Agent periodically
+
+[Timer]
+OnActiveSec=5sec
+OnUnitInactiveSec=30sec
+AccuracySec=5sec
+Unit=wg-access-agent.service
+
+[Install]
+WantedBy=timers.target

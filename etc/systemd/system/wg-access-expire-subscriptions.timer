@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WG Access expire subscriptions maintenance periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

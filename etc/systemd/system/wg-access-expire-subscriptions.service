@@ -1,0 +1,10 @@
+[Unit]
+Description=WG Access expire subscriptions maintenance
+Wants=network-online.target
+After=network-online.target docker.service wg-access-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-access-expire-subscriptions.sh
+User=root
+Group=root

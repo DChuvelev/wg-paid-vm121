@@ -1,0 +1,14 @@
+[Unit]
+Description=WG Access agent event trigger path
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Path]
+PathModified=/opt/wg-access/runtime/agent-trigger/events
+PathChanged=/opt/wg-access/runtime/agent-trigger/pending.trigger
+PathModified=/opt/wg-access/runtime/agent-trigger/pending.trigger
+Unit=wg-access-agent.service
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

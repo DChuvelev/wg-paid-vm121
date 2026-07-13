@@ -1,0 +1,11 @@
+[Unit]
+Description=WG Access Agent real poller
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/wg-access/agent
+Environment=WG_ACCESS_AGENT_ENV=/opt/wg-access/agent/agent.env
+ExecStart=/opt/wg-access/agent/wg_access_agent.py

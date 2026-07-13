@@ -1,0 +1,11 @@
+[Unit]
+Description=WG Access reconcile VM100 runtime peers from VM121 DB
+After=network-online.target docker.service wg-access-agent.service
+Wants=network-online.target docker.service
+ConditionPathExists=/usr/local/sbin/wg-access-reconcile-now.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-access-reconcile-now.sh
+TimeoutStartSec=360
+Nice=5
