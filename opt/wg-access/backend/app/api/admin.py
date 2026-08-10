@@ -21,6 +21,16 @@ from app.agent_trigger import trigger_wg_access_agent_best_effort  # STEP_042C2_
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+def require_legacy_domain_v1_writer_retired():
+    # P22B retired all historical business rows and P23B activated Domain V2.
+    # Legacy mutation endpoints remain visible only as compatibility fences;
+    # they must never recreate invite_codes/subscriptions/peers as authority.
+    raise HTTPException(
+        status_code=410,
+        detail="legacy Domain V1 writer retired; Domain V2 onboarding is not active yet",
+    )
+
+
 class InviteCreateRequest(BaseModel):
     note: str | None = None
     max_uses: int = 1
@@ -39,7 +49,7 @@ class InviteResponse(BaseModel):
         from_attributes = True
 
 
-@router.post("/invites", response_model=InviteResponse)
+@router.post("/invites", response_model=InviteResponse, dependencies=[Depends(require_legacy_domain_v1_writer_retired)])
 def create_invite(payload: InviteCreateRequest, db: Session = Depends(get_db)):
     code = "INV-" + secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16].upper()
     invite = InviteCode(
@@ -105,7 +115,7 @@ class SubscriptionCreateResponse(BaseModel):
     client_config: str
 
 
-@router.post("/subscriptions", response_model=SubscriptionCreateResponse)
+@router.post("/subscriptions", response_model=SubscriptionCreateResponse, dependencies=[Depends(require_legacy_domain_v1_writer_retired)])
 def create_subscription(payload: SubscriptionCreateRequest, db: Session = Depends(get_db)):
     # MVP admin/manual subscription endpoint.
     # It creates a user, an active subscription, a WG peer and a pending enable_peer job.
@@ -255,7 +265,7 @@ class CancelSubscriptionResponse(BaseModel):
     job_ids: list[UUID]
 
 
-@router.post("/subscriptions/{subscription_id}/cancel", response_model=CancelSubscriptionResponse)
+@router.post("/subscriptions/{subscription_id}/cancel", response_model=CancelSubscriptionResponse, dependencies=[Depends(require_legacy_domain_v1_writer_retired)])
 def cancel_subscription(subscription_id: UUID, db: Session = Depends(get_db)):
     subscription = db.get(Subscription, subscription_id)
     if not subscription:
@@ -321,7 +331,7 @@ class DisablePeerResponse(BaseModel):
     enabled: bool
 
 
-@router.post("/peers/{peer_id}/disable", response_model=DisablePeerResponse)
+@router.post("/peers/{peer_id}/disable", response_model=DisablePeerResponse, dependencies=[Depends(require_legacy_domain_v1_writer_retired)])
 def disable_peer(peer_id: UUID, db: Session = Depends(get_db)):
     peer = db.get(Peer, peer_id)
     if not peer:
