@@ -5,3 +5,7 @@ services:
       - type: bind
         source: /opt/wg-access/runtime/agent-trigger
         target: /opt/wg-access/runtime/agent-trigger
+      - type: bind
+        source: /opt/wg-access/runtime/credential-keyring.json
+        target: /opt/wg-access/runtime/credential-keyring.json
+        read_only: true
