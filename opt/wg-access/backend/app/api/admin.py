@@ -198,7 +198,7 @@ class ExpireSubscriptionsResponse(BaseModel):
     subscription_ids: list[UUID]
 
 
-@router.post("/maintenance/expire-subscriptions", response_model=ExpireSubscriptionsResponse)
+@router.post("/maintenance/expire-subscriptions", response_model=ExpireSubscriptionsResponse, dependencies=[Depends(require_legacy_domain_v1_writer_retired)])
 def expire_subscriptions(db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc)
 
