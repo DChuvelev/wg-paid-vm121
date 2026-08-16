@@ -3,12 +3,18 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.session import get_db
-from app.models import Peer, ProvisioningJob
+from app.models import ConnectionProfile, Peer, PeerCredential, ProvisioningJob
+from app.services.credential_service import CredentialServiceError, decrypt_profile_credential
+from app.services.domain_v2 import (
+    DomainV2Error,
+    acknowledge_profile_job,
+    record_profile_job_failure,
+)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -24,7 +30,7 @@ class AgentPeerResponse(BaseModel):
     public_key: str
     preshared_key: str
     tunnel_ip: str
-    paid_until: datetime
+    paid_until: datetime | None
     enabled: bool
 
     class Config:
@@ -37,14 +43,55 @@ def get_enabled_peers(
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
-    rows = db.execute(
+    result: list[AgentPeerResponse] = []
+
+    legacy = db.execute(
         select(Peer)
         .where(Peer.node_id == node_id)
         .where(Peer.enabled == True)
         .order_by(Peer.created_at.asc())
     ).scalars().all()
-    return rows
+    for row in legacy:
+        result.append(AgentPeerResponse.model_validate(row))
 
+    profiles = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.node_id == node_id)
+        .where(ConnectionProfile.protocol == "wireguard")
+        .where(ConnectionProfile.status.in_(("provisioning", "active")))
+        .where(ConnectionProfile.tunnel_ip.is_not(None))
+        .order_by(ConnectionProfile.created_at.asc())
+    ).scalars().all()
+    for profile in profiles:
+        credential = db.execute(
+            select(PeerCredential)
+            .where(
+                PeerCredential.connection_profile_id == profile.id,
+                PeerCredential.revoked_at.is_(None),
+            )
+            .order_by(PeerCredential.revision.desc())
+        ).scalars().first()
+        if credential is None or not credential.public_key:
+            raise HTTPException(status_code=409, detail="profile credential is unavailable")
+        try:
+            secret = decrypt_profile_credential(credential)
+        except CredentialServiceError as exc:
+            raise HTTPException(status_code=503, detail="profile credential decrypt failed") from exc
+        psk = secret.get("preshared_key")
+        if not psk:
+            raise HTTPException(status_code=409, detail="profile credential PSK is unavailable")
+        result.append(
+            AgentPeerResponse(
+                id=profile.id,
+                node_id=profile.node_id,
+                public_key=credential.public_key,
+                preshared_key=psk,
+                tunnel_ip=profile.tunnel_ip,
+                paid_until=profile.expires_at,
+                enabled=True,
+            )
+        )
+    return result
 
 
 class AgentJobResponse(BaseModel):
@@ -52,6 +99,10 @@ class AgentJobResponse(BaseModel):
     node_id: str
     action: str
     peer_id: UUID | None
+    connection_profile_id: UUID | None
+    operation_id: str | None
+    desired_generation: str | None
+    next_attempt_at: datetime | None
     payload_json: dict
     status: str
     attempts: int
@@ -72,10 +123,12 @@ def get_pending_jobs(
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
+    now = datetime.now(timezone.utc)
     rows = db.execute(
         select(ProvisioningJob)
         .where(ProvisioningJob.node_id == node_id)
         .where(ProvisioningJob.status == "pending")
+        .where(or_(ProvisioningJob.next_attempt_at.is_(None), ProvisioningJob.next_attempt_at <= now))
         .order_by(ProvisioningJob.created_at.asc())
         .limit(limit)
     ).scalars().all()
@@ -88,16 +141,21 @@ def start_job(
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
-    job = db.get(ProvisioningJob, job_id)
+    job = db.execute(
+        select(ProvisioningJob).where(ProvisioningJob.id == job_id).with_for_update()
+    ).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status != "pending":
         raise HTTPException(status_code=409, detail=f"job status is {job.status}")
+    now = datetime.now(timezone.utc)
+    if job.next_attempt_at is not None and job.next_attempt_at > now:
+        raise HTTPException(status_code=409, detail="job retry is not due")
 
     job.status = "running"
-    job.started_at = datetime.now(timezone.utc)
+    job.started_at = now
+    job.next_attempt_at = None
     job.attempts += 1
-
     db.commit()
     db.refresh(job)
     return job
@@ -109,16 +167,22 @@ def complete_job(
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
-    job = db.get(ProvisioningJob, job_id)
+    job = db.execute(
+        select(ProvisioningJob).where(ProvisioningJob.id == job_id).with_for_update()
+    ).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status not in ("pending", "running"):
         raise HTTPException(status_code=409, detail=f"job status is {job.status}")
+    try:
+        acknowledge_profile_job(db, job=job)
+    except DomainV2Error as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     job.status = "completed"
     job.completed_at = datetime.now(timezone.utc)
+    job.next_attempt_at = None
     job.last_error = None
-
     db.commit()
     db.refresh(job)
     return job
@@ -131,16 +195,21 @@ def fail_job(
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
-    job = db.get(ProvisioningJob, job_id)
+    job = db.execute(
+        select(ProvisioningJob).where(ProvisioningJob.id == job_id).with_for_update()
+    ).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status not in ("pending", "running"):
         raise HTTPException(status_code=409, detail=f"job status is {job.status}")
 
-    job.status = "failed"
-    job.completed_at = datetime.now(timezone.utc)
-    job.last_error = payload.error
-
+    retried = record_profile_job_failure(db, job=job, error_text=payload.error)
+    if job.connection_profile_id is None:
+        job.status = "failed"
+        job.completed_at = datetime.now(timezone.utc)
+        job.last_error = str(payload.error or "agent failure")[:1000]
+    elif not retried:
+        job.completed_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(job)
     return job

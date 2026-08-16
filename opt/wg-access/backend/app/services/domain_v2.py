@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
+import os
 import uuid
 
 from email_validator import EmailNotValidError, validate_email
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,13 +16,16 @@ from app.models import (
     AccessGrantProtocolLimit,
     AuditEvent,
     ConnectionProfile,
+    Peer,
+    PeerCredential,
     Plan,
     ProvisioningJob,
     User,
 )
 
 SUPPORTED_PROTOCOLS = frozenset({"wireguard", "amneziawg"})
-PROFILE_QUOTA_STATUSES = ("requested", "provisioning", "active")
+PROFILE_QUOTA_STATUSES = ("requested", "provisioning", "active", "disabling", "provisioning_failed")
+WIREGUARD_RUNTIME_PROTOCOL = "wireguard"
 
 
 class DomainV2Error(RuntimeError):
@@ -168,6 +172,252 @@ def protocol_limit(
     return row
 
 
+def _allocator_lock_key(node_id: str, protocol: str) -> int:
+    raw = hashlib.sha256(f"wg-paid/domain-v2/ip-allocator/{node_id}/{protocol}".encode("utf-8")).digest()[:8]
+    value = int.from_bytes(raw, "big", signed=False)
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+def reserve_wireguard_tunnel_ip(db: Session, *, profile: ConnectionProfile) -> str:
+    """Reserve a unique WireGuard tunnel IP inside the caller transaction.
+
+    The PostgreSQL advisory transaction lock serializes allocation even when the
+    profile table is empty. Legacy enabled peers are also treated as reservations
+    so Domain V2 cannot collide with an existing VM100 identity.
+    """
+    if profile.protocol != WIREGUARD_RUNTIME_PROTOCOL:
+        raise ProtocolNotAllowed("runtime allocation is currently enabled only for wireguard")
+    if profile.tunnel_ip:
+        return profile.tunnel_ip
+
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": _allocator_lock_key(profile.node_id, profile.protocol)},
+    )
+
+    from app.services.wireguard import iter_wireguard_client_ips
+
+    used_profiles = set(
+        db.execute(
+            select(ConnectionProfile.tunnel_ip).where(
+                ConnectionProfile.node_id == profile.node_id,
+                ConnectionProfile.tunnel_ip.is_not(None),
+                ConnectionProfile.id != profile.id,
+            )
+        ).scalars().all()
+    )
+    used_legacy = set(
+        db.execute(
+            select(Peer.tunnel_ip).where(
+                Peer.node_id == profile.node_id,
+                Peer.enabled.is_(True),
+            )
+        ).scalars().all()
+    )
+    used = used_profiles | used_legacy
+
+    for candidate in iter_wireguard_client_ips():
+        if candidate in used:
+            continue
+        profile.tunnel_ip = candidate
+        profile.tunnel_ip_reserved_at = utcnow()
+        profile.tunnel_ip_released_at = None
+        db.flush()
+        return candidate
+    raise DomainV2Error("wireguard tunnel IP pool exhausted")
+
+
+def current_profile_credential(db: Session, *, profile_id: uuid.UUID) -> PeerCredential:
+    row = db.execute(
+        select(PeerCredential)
+        .where(
+            PeerCredential.connection_profile_id == profile_id,
+            PeerCredential.revoked_at.is_(None),
+        )
+        .order_by(PeerCredential.revision.desc())
+    ).scalars().first()
+    if row is None:
+        raise DomainV2Error("profile has no active credential revision")
+    return row
+
+
+def prepare_wireguard_profile_provisioning(
+    db: Session,
+    *,
+    profile: ConnectionProfile,
+) -> tuple[ProvisioningJob, bool]:
+    """Atomically reserve IP, create encrypted credentials and enqueue runtime intent."""
+    if profile.protocol != WIREGUARD_RUNTIME_PROTOCOL:
+        raise ProtocolNotAllowed("wireguard is the first activated runtime protocol")
+
+    locked = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.id == profile.id)
+        .with_for_update()
+    ).scalar_one()
+
+    tunnel_ip = reserve_wireguard_tunnel_ip(db, profile=locked)
+    credential = db.execute(
+        select(PeerCredential)
+        .where(
+            PeerCredential.connection_profile_id == locked.id,
+            PeerCredential.revoked_at.is_(None),
+        )
+        .order_by(PeerCredential.revision.desc())
+        .with_for_update()
+    ).scalars().first()
+    if credential is None:
+        from app.services.credential_service import create_profile_credential_revision
+        credential = create_profile_credential_revision(db, profile_id=locked.id).credential
+
+    locked.status = "provisioning"
+    locked.updated_at = utcnow()
+    desired_generation = hashlib.sha256(
+        f"{locked.id}|{locked.protocol}|{credential.public_key}|{tunnel_ip}|r{credential.revision}".encode("utf-8")
+    ).hexdigest()[:32]
+    operation_id = f"profile-provision:{locked.id}:r{credential.revision}"
+    job, created = enqueue_profile_job(
+        db,
+        profile=locked,
+        action="provision_profile",
+        operation_id=operation_id,
+        desired_generation=desired_generation,
+        payload={
+            "profile_id": str(locked.id),
+            "protocol": locked.protocol,
+            "public_key": credential.public_key,
+            "tunnel_ip": tunnel_ip,
+            "credential_revision": credential.revision,
+        },
+    )
+    return job, created
+
+
+def request_profile_disable(
+    db: Session,
+    *,
+    profile_id: uuid.UUID,
+) -> tuple[ConnectionProfile, ProvisioningJob, bool]:
+    profile = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.id == profile_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if profile is None:
+        raise DomainV2Error("connection profile does not exist")
+    if profile.protocol != WIREGUARD_RUNTIME_PROTOCOL:
+        raise ProtocolNotAllowed("wireguard is the first activated runtime protocol")
+    if profile.status == "disabled":
+        existing = db.execute(
+            select(ProvisioningJob)
+            .where(
+                ProvisioningJob.connection_profile_id == profile.id,
+                ProvisioningJob.action == "disable_profile",
+            )
+            .order_by(ProvisioningJob.created_at.desc())
+        ).scalars().first()
+        if existing is None:
+            raise DomainV2Error("disabled profile has no disable ACK history")
+        return profile, existing, False
+    if not profile.tunnel_ip:
+        raise DomainV2Error("profile has no reserved tunnel IP")
+
+    credential = current_profile_credential(db, profile_id=profile.id)
+    profile.status = "disabling"
+    profile.updated_at = utcnow()
+    generation = hashlib.sha256(
+        f"{profile.id}|{credential.public_key}|{profile.tunnel_ip}|disable".encode("utf-8")
+    ).hexdigest()[:32]
+    operation_id = f"profile-disable:{profile.id}:{generation[:12]}"
+    job, created = enqueue_profile_job(
+        db,
+        profile=profile,
+        action="disable_profile",
+        operation_id=operation_id,
+        desired_generation=generation,
+        payload={
+            "profile_id": str(profile.id),
+            "protocol": profile.protocol,
+            "public_key": credential.public_key,
+            "tunnel_ip": profile.tunnel_ip,
+        },
+    )
+    return profile, job, created
+
+
+def acknowledge_profile_job(db: Session, *, job: ProvisioningJob) -> None:
+    if job.connection_profile_id is None:
+        return
+    profile = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.id == job.connection_profile_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if profile is None:
+        raise DomainV2Error("connection profile does not exist")
+    now = utcnow()
+    if job.action == "provision_profile":
+        if not profile.tunnel_ip:
+            raise DomainV2Error("provision ACK without tunnel IP reservation")
+        profile.status = "active"
+        profile.updated_at = now
+    elif job.action == "disable_profile":
+        if profile.tunnel_ip is None:
+            raise DomainV2Error("disable ACK without reserved tunnel IP")
+        credentials = db.execute(
+            select(PeerCredential)
+            .where(
+                PeerCredential.connection_profile_id == profile.id,
+                PeerCredential.revoked_at.is_(None),
+            )
+            .with_for_update()
+        ).scalars().all()
+        for credential in credentials:
+            credential.revoked_at = now
+        profile.status = "disabled"
+        profile.disabled_at = now
+        profile.tunnel_ip = None
+        profile.tunnel_ip_released_at = now
+        profile.updated_at = now
+    else:
+        raise DomainV2Error(f"unsupported Domain V2 job action: {job.action}")
+    db.flush()
+
+
+def record_profile_job_failure(
+    db: Session,
+    *,
+    job: ProvisioningJob,
+    error_text: str,
+) -> bool:
+    """Return True when the job is scheduled for another attempt."""
+    if job.connection_profile_id is None:
+        return False
+    max_attempts = max(1, int(os.environ.get("WG_DOMAIN_V2_MAX_ATTEMPTS", "8")))
+    capped = str(error_text or "provisioning failure")[:1000]
+    job.last_error = capped
+    job.completed_at = None
+    if job.attempts < max_attempts:
+        delay = min(300, 5 * (2 ** max(0, job.attempts - 1)))
+        job.status = "pending"
+        job.next_attempt_at = utcnow() + timedelta(seconds=delay)
+        db.flush()
+        return True
+
+    job.status = "failed"
+    job.next_attempt_at = None
+    profile = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.id == job.connection_profile_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if profile is not None and job.action == "provision_profile":
+        profile.status = "provisioning_failed"
+        profile.updated_at = utcnow()
+    db.flush()
+    return False
+
+
 def enqueue_profile_job(
     db: Session,
     *,
@@ -193,7 +443,7 @@ def enqueue_profile_job(
         connection_profile_id=profile.id,
         operation_id=operation_id,
         desired_generation=desired_generation,
-        next_attempt_at=None,
+        next_attempt_at=utcnow(),
         payload_json=dict(payload or {}),
         status="pending",
         attempts=0,
@@ -249,18 +499,26 @@ def create_profile_request(
     db.add(profile)
     db.flush()
 
-    desired_generation = hashlib.sha256(
-        f"{profile.id}|{profile.protocol}|requested|1".encode("utf-8")
-    ).hexdigest()[:32]
-    operation_id = f"profile-provision:{profile.id}:r1"
-    job, created = enqueue_profile_job(
-        db,
-        profile=profile,
-        action="provision_profile",
-        operation_id=operation_id,
-        desired_generation=desired_generation,
-        payload={"profile_id": str(profile.id), "protocol": protocol},
-    )
+    if protocol == WIREGUARD_RUNTIME_PROTOCOL:
+        job, created = prepare_wireguard_profile_provisioning(db, profile=profile)
+    else:
+        # AmneziaWG remains a durable Domain V2 request only. VM100 has no
+        # activated awg_paid user-facing runtime yet, so the job is explicitly
+        # deferred and cannot be consumed by the WireGuard agent.
+        desired_generation = hashlib.sha256(
+            f"{profile.id}|{profile.protocol}|requested|deferred".encode("utf-8")
+        ).hexdigest()[:32]
+        operation_id = f"profile-deferred:{profile.id}:r1"
+        job, created = enqueue_profile_job(
+            db,
+            profile=profile,
+            action="provision_profile_deferred",
+            operation_id=operation_id,
+            desired_generation=desired_generation,
+            payload={"profile_id": str(profile.id), "protocol": protocol, "runtime_deferred": True},
+        )
+        job.status = "deferred"
+        job.next_attempt_at = None
     return ProfileRequestResult(profile=profile, job=job, created_job=created)
 
 

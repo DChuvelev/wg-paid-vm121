@@ -440,9 +440,9 @@ def sync_enabled_peers():
 def verify_job_against_reconciled_state(job, desired, registry_rows):
     action = job["action"]
     payload = job["payload_json"]
-    peer_id = str(job.get("peer_id") or "")
+    peer_id = str(job.get("peer_id") or job.get("connection_profile_id") or "")
 
-    if action == "enable_peer":
+    if action in {"enable_peer", "provision_profile"}:
         public_key = require_wg_key("public_key", payload["public_key"])
         tunnel_ip = require_tunnel_ip(payload["tunnel_ip"])
         row = next(
@@ -460,18 +460,18 @@ def verify_job_against_reconciled_state(job, desired, registry_rows):
                 f"enable job not satisfied by lifecycle reconcile peer_id={peer_id}"
             )
         log(
-            f"REAL enable_peer verified via VM100 lifecycle "
+            f"REAL {action} verified via VM100 lifecycle "
             f"peer_id={peer_id} tunnel_ip={tunnel_ip}"
         )
         return
 
-    if action == "disable_peer":
+    if action in {"disable_peer", "disable_profile"}:
         public_key = require_wg_key("public_key", payload["public_key"])
         if any(item["public_key"] == public_key for item in registry_rows):
             raise RuntimeError(
                 f"disable job still present in VM100 lifecycle registry peer_id={peer_id}"
             )
-        log(f"REAL disable_peer verified via VM100 lifecycle peer_id={peer_id}")
+        log(f"REAL {action} verified via VM100 lifecycle peer_id={peer_id}")
         return
 
     raise RuntimeError(f"unsupported action: {action}")

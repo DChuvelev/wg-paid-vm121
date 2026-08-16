@@ -38,21 +38,35 @@ def generate_wg_psk() -> str:
     return b64(secrets.token_bytes(32))
 
 
-def next_tunnel_ip(db: Session, node_id: str) -> str:
-    # MVP allocator:
-    # - pool is /16 by default: 10.253.0.0/16
-    # - client addresses start at 10.253.1.10
-    # - only enabled peers reserve addresses
-    # - disabled peers keep history but their addresses can be reused
+def wireguard_client_pool() -> tuple[ipaddress.IPv4Network, ipaddress.IPv4Address]:
+    """Return the canonical WireGuard client pool configured for this backend.
+
+    Domain V2 and the legacy allocator intentionally share these exact settings.
+    """
     pool_cidr = os.environ.get("WG_CLIENT_POOL_CIDR", "10.253.0.0/16").strip()
     first_client_ip = os.environ.get("WG_CLIENT_FIRST_IP", "10.253.1.10").strip()
-
     pool = ipaddress.ip_network(pool_cidr, strict=False)
     first_ip = ipaddress.ip_address(first_client_ip)
-
+    if pool.version != 4 or first_ip.version != 4:
+        raise RuntimeError("WireGuard client pool must be IPv4")
     if first_ip not in pool:
         raise RuntimeError(f"WG_CLIENT_FIRST_IP {first_client_ip} is outside {pool_cidr}")
+    if first_ip >= pool.broadcast_address:
+        raise RuntimeError("WG_CLIENT_FIRST_IP leaves no usable client addresses")
+    return pool, first_ip
 
+
+def iter_wireguard_client_ips():
+    pool, current = wireguard_client_pool()
+    last_ip = pool.broadcast_address - 1
+    while current <= last_ip:
+        yield str(current)
+        current += 1
+
+
+def next_tunnel_ip(db: Session, node_id: str) -> str:
+    # Legacy allocator retained for compatibility. It now consumes the same
+    # pool iterator as Domain V2, so the pool boundary is defined only once.
     used = set(
         db.execute(
             select(Peer.tunnel_ip).where(
@@ -61,17 +75,11 @@ def next_tunnel_ip(db: Session, node_id: str) -> str:
             )
         ).scalars().all()
     )
-
-    current = first_ip
-    last_ip = pool.broadcast_address - 1
-
-    while current <= last_ip:
-        ip_text = str(current)
+    for ip_text in iter_wireguard_client_ips():
         if ip_text not in used:
             return ip_text
-        current += 1
-
-    raise RuntimeError(f"No free tunnel IPs left in pool {pool_cidr}")
+    pool, _ = wireguard_client_pool()
+    raise RuntimeError(f"No free tunnel IPs left in pool {pool}")
 
 
 def build_client_config(private_key: str, tunnel_ip: str, preshared_key: str) -> str:

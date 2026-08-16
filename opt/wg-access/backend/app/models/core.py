@@ -7,10 +7,12 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Index,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -137,6 +139,13 @@ class ConnectionProfile(Base):
     __tablename__ = "connection_profiles"
     __table_args__ = (
         CheckConstraint("protocol IN ('wireguard','amneziawg')", name="connection_profiles_protocol_check"),
+        Index(
+            "uq_connection_profiles_node_tunnel_ip_reserved",
+            "node_id",
+            "tunnel_ip",
+            unique=True,
+            postgresql_where=text("tunnel_ip IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -146,6 +155,9 @@ class ConnectionProfile(Base):
     node_id: Mapped[str] = mapped_column(String(64), nullable=False)
     label: Mapped[str | None] = mapped_column(String(160), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    tunnel_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tunnel_ip_reserved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tunnel_ip_released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
