@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import secrets
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
@@ -29,6 +30,18 @@ from app.services.auth_v2 import (
     revoke_session,
 )
 from app.services.domain_v2 import InvalidIdentity, record_audit_event
+
+from app.services.profile_delivery import (
+    ProfileNotReady,
+    ProfileSurfaceError,
+    ProfileUnavailable,
+    build_owned_wireguard_config,
+    build_qr_svg,
+    create_owned_profile,
+    list_owned_profiles,
+    reissue_owned_profile,
+    revoke_owned_profile,
+)
 
 router = APIRouter(prefix="/v2", tags=["domain-v2-auth"])
 
@@ -351,3 +364,222 @@ def logout(
     _clear_session_cookies(response)
     response.status_code = status.HTTP_204_NO_CONTENT
     return None
+
+
+def _private_no_store(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+
+class ProfileSummary(BaseModel):
+    id: UUID
+    protocol: str
+    status: str
+    tunnel_ip: str | None
+    label: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProfileMutationResponse(BaseModel):
+    profile: ProfileSummary
+    job_id: UUID
+    job_created: bool
+
+
+class ProfileCreateRequest(BaseModel):
+    grant_id: UUID
+    protocol: Literal["wireguard"] = "wireguard"
+    label: str | None = None
+
+
+def _profile_summary(profile) -> ProfileSummary:
+    return ProfileSummary(
+        id=profile.id,
+        protocol=profile.protocol,
+        status=profile.status,
+        tunnel_ip=profile.tunnel_ip,
+        label=profile.label,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at,
+    )
+
+
+@router.get("/account/profiles", response_model=list[ProfileSummary])
+def account_profiles(
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    rows = list_owned_profiles(db, user=user)
+    return [_profile_summary(row) for row in rows]
+
+
+@router.post(
+    "/account/profiles",
+    response_model=ProfileMutationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def account_profile_create(
+    payload: ProfileCreateRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    req = _request_id(request)
+    try:
+        result = create_owned_profile(
+            db,
+            user=user,
+            grant_id=payload.grant_id,
+            protocol=payload.protocol,
+            node_id=settings.wg_default_node_id,
+            label=payload.label,
+            request_id=req,
+        )
+        db.commit()
+        db.refresh(result.profile)
+    except ProfileSurfaceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="profile cannot be created") from exc
+    return ProfileMutationResponse(
+        profile=_profile_summary(result.profile),
+        job_id=result.job.id,
+        job_created=result.created_job,
+    )
+
+
+@router.get("/account/profiles/{profile_id}/config")
+def account_profile_config(
+    profile_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    try:
+        config_text = build_owned_wireguard_config(
+            db,
+            user=user,
+            profile_id=profile_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile not found") from exc
+    except ProfileNotReady as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="profile is not ready") from exc
+    response = Response(content=config_text, media_type="text/plain; charset=utf-8")
+    _private_no_store(response)
+    return response
+
+
+@router.get("/account/profiles/{profile_id}/qr.svg")
+def account_profile_qr(
+    profile_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    try:
+        config_text = build_owned_wireguard_config(
+            db,
+            user=user,
+            profile_id=profile_id,
+            request_id=_request_id(request),
+            audit_event="profile.qr.delivered",
+        )
+        qr_svg = build_qr_svg(config_text)
+        db.commit()
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile not found") from exc
+    except ProfileNotReady as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="profile is not ready") from exc
+    response = Response(content=qr_svg, media_type="image/svg+xml; charset=utf-8")
+    _private_no_store(response)
+    response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+    return response
+
+
+@router.post(
+    "/account/profiles/{profile_id}/revoke",
+    response_model=ProfileMutationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def account_profile_revoke(
+    profile_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        profile, job, created = revoke_owned_profile(
+            db,
+            user=user,
+            profile_id=profile_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(profile)
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile not found") from exc
+    except ProfileSurfaceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="profile cannot be revoked") from exc
+    return ProfileMutationResponse(
+        profile=_profile_summary(profile),
+        job_id=job.id,
+        job_created=created,
+    )
+
+
+@router.post(
+    "/account/profiles/{profile_id}/reissue",
+    response_model=ProfileMutationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def account_profile_reissue(
+    profile_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        profile, job, created = reissue_owned_profile(
+            db,
+            user=user,
+            profile_id=profile_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(profile)
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile not found") from exc
+    except ProfileSurfaceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="profile cannot be reissued") from exc
+    return ProfileMutationResponse(
+        profile=_profile_summary(profile),
+        job_id=job.id,
+        job_created=created,
+    )

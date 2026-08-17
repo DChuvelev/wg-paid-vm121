@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     auth_login_rate_limit: int = 5
     auth_redeem_rate_limit: int = 10
     auth_magic_consume_rate_limit: int = 10
+    wg_default_node_id: str = "ddn-test"
 
     class Config:
         env_file = ".env"
