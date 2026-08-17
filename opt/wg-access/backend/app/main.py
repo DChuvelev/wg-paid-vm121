@@ -6,12 +6,14 @@ from app.db.session import engine
 from app.api.admin import router as admin_router
 from app.api.dev import router as dev_router
 from app.api.agent import router as agent_router
+from app.api.auth_v2 import router as auth_v2_router
 
-app = FastAPI(title="WG Access Backend", version="0.0.3")
+app = FastAPI(title="WG Access Backend", version="0.0.4")
 
 app.include_router(admin_router)
 app.include_router(dev_router)
 app.include_router(agent_router)
+app.include_router(auth_v2_router)
 
 
 @app.get("/health")
