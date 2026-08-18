@@ -11,6 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches
+from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
 from app.models import AccessGrant, AuthSession, User
 from app.services.auth_v2 import (
@@ -29,7 +31,7 @@ from app.services.auth_v2 import (
     request_id_or_new,
     revoke_session,
 )
-from app.services.domain_v2 import InvalidIdentity, record_audit_event
+from app.services.domain_v2 import InvalidIdentity, record_audit_event, utcnow
 
 from app.services.profile_delivery import (
     ProfileNotReady,
@@ -66,10 +68,11 @@ def _require_external_onboarding() -> None:
 
 
 def _require_admin(x_admin_token: str | None = Header(default=None)) -> None:
-    expected = settings.auth_admin_token
-    if not expected:
-        raise HTTPException(status_code=503, detail="admin authorization is not configured")
-    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+    try:
+        matched = admin_token_matches(x_admin_token)
+    except AdminAuthorizationUnavailable as exc:
+        raise HTTPException(status_code=503, detail="admin authorization is not configured") from exc
+    if not matched:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -244,12 +247,40 @@ def login_request(
         raise HTTPException(status_code=429, detail="too many requests") from exc
 
     try:
-        issue_magic_link_for_email(
+        result = issue_magic_link_for_email(
             db,
             email=payload.email,
             ttl_seconds=settings.auth_magic_link_ttl_seconds,
             request_id=req,
         )
+        if result.row is not None and result.token is not None:
+            try:
+                deliver_magic_link_email(
+                    to_email=result.row.email,
+                    token=result.token,
+                )
+                record_audit_event(
+                    db,
+                    event_type="auth.magic_link.delivered",
+                    actor_kind="system",
+                    object_type="magic_link_token",
+                    object_id=str(result.row.id),
+                    request_id=req,
+                    payload={"email_hash": email_fingerprint(result.row.email)},
+                )
+            except MailDeliveryError:
+                # An undelivered token must not remain usable. The public response
+                # stays generic so delivery state cannot become an enumeration oracle.
+                result.row.consumed_at = utcnow()
+                record_audit_event(
+                    db,
+                    event_type="auth.magic_link.delivery_failed",
+                    actor_kind="system",
+                    object_type="magic_link_token",
+                    object_id=str(result.row.id),
+                    request_id=req,
+                    payload={"email_hash": email_fingerprint(result.row.email)},
+                )
         db.commit()
     except InvalidIdentity:
         db.rollback()
