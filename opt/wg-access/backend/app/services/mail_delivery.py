@@ -72,7 +72,6 @@ def smtp_delivery_status() -> dict[str, object]:
     if active:
         try:
             host, port, security, username, from_email, from_name, timeout = _delivery_settings()
-            _magic_link_url("status-probe")
             if username:
                 _read_root_secret(settings.smtp_password_file, label="SMTP password")
             configured = True
