@@ -13,3 +13,7 @@ services:
         source: /opt/wg-access/runtime/secrets/smtp-vpn.password
         target: /opt/wg-access/runtime/secrets/smtp-vpn.password
         read_only: true
+      - type: bind
+        source: /opt/wg-access/runtime/secrets/admin-auth.token
+        target: /opt/wg-access/runtime/secrets/admin-auth.token
+        read_only: true
