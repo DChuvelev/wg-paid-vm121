@@ -27,7 +27,7 @@ from app.services.auth_v2 import (
     enforce_rate_limit,
     issue_invite,
     issue_magic_link_for_email,
-    redeem_invite,
+    request_invite_registration,
     request_id_or_new,
     revoke_session,
 )
@@ -128,8 +128,8 @@ def _clear_session_cookies(response: Response) -> None:
 
 
 class AdminInviteRequest(BaseModel):
-    intended_email: EmailStr
-    plan_id: UUID | None = None
+    intended_email: EmailStr | None = None
+    plan_id: UUID
 
 
 class AdminInviteResponse(BaseModel):
@@ -153,7 +153,7 @@ def admin_create_invite(
     try:
         result = issue_invite(
             db,
-            intended_email=str(payload.intended_email),
+            intended_email=str(payload.intended_email) if payload.intended_email else None,
             ttl_seconds=settings.auth_invite_ttl_seconds,
             plan_id=payload.plan_id,
             request_id=req,
@@ -198,12 +198,45 @@ def redeem_invite_route(
         raise HTTPException(status_code=429, detail="too many requests") from exc
 
     try:
-        user = redeem_invite(
+        result = request_invite_registration(
             db,
             token=payload.invite_token,
             email=str(payload.email),
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
             request_id=req,
         )
+        if result.row is not None and result.token is not None:
+            try:
+                deliver_magic_link_email(
+                    to_email=result.row.email,
+                    token=result.token,
+                )
+                record_audit_event(
+                    db,
+                    event_type="auth.magic_link.delivered",
+                    actor_kind="system",
+                    object_type="magic_link_token",
+                    object_id=str(result.row.id),
+                    request_id=req,
+                    payload={
+                        "email_hash": email_fingerprint(result.row.email),
+                        "purpose": result.row.purpose,
+                    },
+                )
+            except MailDeliveryError:
+                result.row.consumed_at = utcnow()
+                record_audit_event(
+                    db,
+                    event_type="auth.magic_link.delivery_failed",
+                    actor_kind="system",
+                    object_type="magic_link_token",
+                    object_id=str(result.row.id),
+                    request_id=req,
+                    payload={
+                        "email_hash": email_fingerprint(result.row.email),
+                        "purpose": result.row.purpose,
+                    },
+                )
         db.commit()
     except (InviteRejected, InvalidIdentity) as exc:
         db.rollback()
@@ -216,7 +249,7 @@ def redeem_invite_route(
         )
         db.commit()
         raise HTTPException(status_code=400, detail="invalid invite") from exc
-    return {"status": "accepted", "user_id": str(user.id)}
+    return GENERIC_LOGIN_RESPONSE
 
 
 class LoginRequest(BaseModel):
@@ -327,6 +360,7 @@ def consume_magic_link_route(
             db,
             token=payload.token,
             session_ttl_seconds=settings.auth_session_ttl_seconds,
+            wg_node_id=settings.wg_default_node_id,
             request_id=req,
         )
         db.commit()

@@ -22,8 +22,10 @@ from app.models import (
 from app.services.domain_v2 import (
     InvalidIdentity,
     create_grant_from_plan,
+    create_profile_request,
     ensure_verified_user,
     normalize_email,
+    protocol_limit,
     record_audit_event,
     utcnow,
 )
@@ -102,18 +104,17 @@ def request_id_or_new(value: str | None) -> str:
 def issue_invite(
     db: Session,
     *,
-    intended_email: str,
+    intended_email: str | None,
     ttl_seconds: int,
-    plan_id: uuid.UUID | None = None,
+    plan_id: uuid.UUID,
     request_id: str | None = None,
 ) -> InviteIssueResult:
-    normalized = normalize_email(intended_email)
+    normalized = normalize_email(intended_email) if intended_email else None
     if ttl_seconds < 60:
         raise AuthV2Error("invite ttl is too short")
-    if plan_id is not None:
-        plan = db.get(Plan, plan_id)
-        if plan is None or not plan.active:
-            raise AuthV2Error("plan is unavailable")
+    plan = db.get(Plan, plan_id)
+    if plan is None or not plan.active:
+        raise AuthV2Error("plan is unavailable")
 
     tok = secret_token()
     now = utcnow()
@@ -139,7 +140,8 @@ def issue_invite(
         object_id=str(row.id),
         request_id=request_id_or_new(request_id),
         payload={
-            "email_hash": email_fingerprint(normalized),
+            "email_bound": normalized is not None,
+            "email_hash": email_fingerprint(normalized) if normalized else None,
             "plan_id": str(plan_id) if plan_id else None,
             "max_uses": 1,
         },
@@ -147,13 +149,12 @@ def issue_invite(
     return InviteIssueResult(invite=row, token=tok.raw)
 
 
-def redeem_invite(
+def _validated_invite_for_registration(
     db: Session,
     *,
     token: str,
     email: str,
-    request_id: str | None = None,
-) -> User:
+) -> tuple[Invite, str, datetime]:
     normalized = normalize_email(email)
     digest = _sha256_text(str(token or ""))
     now = utcnow()
@@ -168,52 +169,96 @@ def redeem_invite(
         raise InviteRejected("invalid invite")
     if invite.used_count >= invite.max_uses:
         raise InviteRejected("invalid invite")
-    if not invite.intended_email or normalize_email(invite.intended_email) != normalized:
+    if invite.intended_email and normalize_email(invite.intended_email) != normalized:
         raise InviteRejected("invalid invite")
-
-    existing_redemption = db.execute(
-        select(InviteRedemption).where(InviteRedemption.invite_id == invite.id)
-    ).scalars().first()
-    if existing_redemption is not None:
+    if invite.plan_id is None:
         raise InviteRejected("invalid invite")
+    plan = db.get(Plan, invite.plan_id)
+    if plan is None or not plan.active:
+        raise InviteRejected("invalid invite")
+    return invite, normalized, now
 
-    user = ensure_verified_user(db, normalized, verified_at=now)
-    redemption = InviteRedemption(
-        id=uuid.uuid4(),
-        invite_id=invite.id,
-        user_id=user.id,
-        redeemed_at=now,
+
+def request_invite_registration(
+    db: Session,
+    *,
+    token: str,
+    email: str,
+    ttl_seconds: int,
+    request_id: str | None = None,
+) -> MagicLinkIssueResult:
+    if ttl_seconds < 60:
+        raise AuthV2Error("magic-link ttl is too short")
+    invite, normalized, now = _validated_invite_for_registration(
+        db, token=token, email=email
     )
-    db.add(redemption)
-    invite.used_count += 1
+    req = request_id_or_new(request_id)
 
-    if invite.plan_id is not None:
-        plan = db.get(Plan, invite.plan_id)
-        if plan is None or not plan.active:
-            raise InviteRejected("invalid invite")
-        create_grant_from_plan(
+    # An already registered address follows the ordinary login path. The invite
+    # remains unused so invite possession does not alter existing entitlement.
+    existing_user = db.execute(
+        select(User).where(User.email == normalized)
+    ).scalar_one_or_none()
+    if existing_user is not None:
+        record_audit_event(
             db,
-            user=user,
-            plan=plan,
-            source_type="invite",
-            source_ref=str(invite.id),
-            valid_from=now,
-            valid_until=None,
+            event_type="auth.invite.existing_user_login",
+            actor_kind="anonymous",
+            object_type="invite",
+            object_id=str(invite.id),
+            request_id=req,
+            payload={"email_hash": email_fingerprint(normalized)},
+        )
+        return issue_magic_link_for_email(
+            db,
+            email=normalized,
+            ttl_seconds=ttl_seconds,
+            request_id=req,
         )
 
+    # Reissuing for the same invite+email invalidates only older tokens for the
+    # same pending registration. Different recipients may hold pending tokens;
+    # the first valid consume wins the one-use invite transactionally.
+    prior = db.execute(
+        select(MagicLinkToken)
+        .where(
+            MagicLinkToken.invite_id == invite.id,
+            MagicLinkToken.email == normalized,
+            MagicLinkToken.purpose == "registration",
+            MagicLinkToken.consumed_at.is_(None),
+        )
+        .with_for_update()
+    ).scalars().all()
+    for old in prior:
+        old.consumed_at = now
+
+    tok = secret_token()
+    row = MagicLinkToken(
+        id=uuid.uuid4(),
+        token_hash=tok.digest,
+        email=normalized,
+        user_id=None,
+        invite_id=invite.id,
+        purpose="registration",
+        expires_at=now + timedelta(seconds=ttl_seconds),
+        consumed_at=None,
+        created_at=now,
+    )
+    db.add(row)
+    db.flush()
     record_audit_event(
         db,
-        event_type="auth.invite.redeemed",
-        actor_kind="user",
-        actor_user_id=user.id,
-        object_type="invite",
-        object_id=str(invite.id),
-        request_id=request_id_or_new(request_id),
-        payload={"email_hash": email_fingerprint(normalized)},
+        event_type="auth.registration_magic_link.issued",
+        actor_kind="system",
+        object_type="magic_link_token",
+        object_id=str(row.id),
+        request_id=req,
+        payload={
+            "email_hash": email_fingerprint(normalized),
+            "invite_id": str(invite.id),
+        },
     )
-    db.flush()
-    return user
-
+    return MagicLinkIssueResult(row=row, token=tok.raw)
 
 def issue_magic_link_for_email(
     db: Session,
@@ -259,6 +304,7 @@ def issue_magic_link_for_email(
         token_hash=tok.digest,
         email=normalized,
         user_id=user.id,
+        invite_id=None,
         purpose="login",
         expires_at=now + timedelta(seconds=ttl_seconds),
         consumed_at=None,
@@ -279,31 +325,13 @@ def issue_magic_link_for_email(
     return MagicLinkIssueResult(row=row, token=tok.raw)
 
 
-def consume_magic_link(
+def _issue_session_for_user(
     db: Session,
     *,
-    token: str,
+    user: User,
+    now: datetime,
     session_ttl_seconds: int,
-    request_id: str | None = None,
 ) -> SessionIssueResult:
-    digest = _sha256_text(str(token or ""))
-    now = utcnow()
-    row = db.execute(
-        select(MagicLinkToken).where(MagicLinkToken.token_hash == digest).with_for_update()
-    ).scalar_one_or_none()
-    if row is None or row.purpose != "login" or row.user_id is None:
-        raise MagicLinkRejected("invalid magic link")
-    if row.consumed_at is not None:
-        raise MagicLinkRejected("invalid magic link")
-    if row.expires_at <= now:
-        raise MagicLinkRejected("invalid magic link")
-    user = db.get(User, row.user_id)
-    if user is None or user.email_verified_at is None:
-        raise MagicLinkRejected("invalid magic link")
-    if session_ttl_seconds < 60:
-        raise AuthV2Error("session ttl is too short")
-
-    row.consumed_at = now
     tok = secret_token()
     session = AuthSession(
         id=uuid.uuid4(),
@@ -316,29 +344,153 @@ def consume_magic_link(
     )
     db.add(session)
     db.flush()
+    return SessionIssueResult(session=session, token=tok.raw)
+
+
+def consume_magic_link(
+    db: Session,
+    *,
+    token: str,
+    session_ttl_seconds: int,
+    wg_node_id: str,
+    request_id: str | None = None,
+) -> SessionIssueResult:
+    if session_ttl_seconds < 60:
+        raise AuthV2Error("session ttl is too short")
+    digest = _sha256_text(str(token or ""))
+    now = utcnow()
+    row = db.execute(
+        select(MagicLinkToken).where(MagicLinkToken.token_hash == digest).with_for_update()
+    ).scalar_one_or_none()
+    if row is None or row.consumed_at is not None or row.expires_at <= now:
+        raise MagicLinkRejected("invalid magic link")
+
     req = request_id_or_new(request_id)
+
+    if row.purpose == "login":
+        if row.user_id is None or row.invite_id is not None:
+            raise MagicLinkRejected("invalid magic link")
+        user = db.get(User, row.user_id)
+        if user is None or user.email_verified_at is None:
+            raise MagicLinkRejected("invalid magic link")
+        row.consumed_at = now
+        result = _issue_session_for_user(
+            db, user=user, now=now, session_ttl_seconds=session_ttl_seconds
+        )
+    elif row.purpose == "registration":
+        if row.user_id is not None or row.invite_id is None:
+            raise MagicLinkRejected("invalid magic link")
+        invite = db.execute(
+            select(Invite).where(Invite.id == row.invite_id).with_for_update()
+        ).scalar_one_or_none()
+        if invite is None or invite.revoked_at is not None:
+            raise MagicLinkRejected("invalid magic link")
+        if invite.expires_at is not None and invite.expires_at <= now:
+            raise MagicLinkRejected("invalid magic link")
+        if invite.used_count >= invite.max_uses:
+            raise MagicLinkRejected("invalid magic link")
+        normalized = normalize_email(row.email)
+        if invite.intended_email and normalize_email(invite.intended_email) != normalized:
+            raise MagicLinkRejected("invalid magic link")
+        if db.execute(select(User).where(User.email == normalized)).scalar_one_or_none() is not None:
+            raise MagicLinkRejected("invalid magic link")
+
+        user = ensure_verified_user(db, normalized, verified_at=now)
+        redemption = InviteRedemption(
+            id=uuid.uuid4(),
+            invite_id=invite.id,
+            user_id=user.id,
+            redeemed_at=now,
+        )
+        db.add(redemption)
+        invite.used_count += 1
+
+        grant = None
+        if invite.plan_id is not None:
+            plan = db.get(Plan, invite.plan_id)
+            if plan is None or not plan.active:
+                raise MagicLinkRejected("invalid magic link")
+            grant = create_grant_from_plan(
+                db,
+                user=user,
+                plan=plan,
+                source_type="invite",
+                source_ref=str(invite.id),
+                valid_from=now,
+                valid_until=None,
+            )
+
+            wg_limit = protocol_limit(db, grant_id=grant.id, protocol="wireguard")
+            if wg_limit.profile_limit > 0:
+                profile_result = create_profile_request(
+                    db,
+                    user=user,
+                    grant_id=grant.id,
+                    protocol="wireguard",
+                    node_id=wg_node_id,
+                    label=None,
+                    now=now,
+                )
+                record_audit_event(
+                    db,
+                    event_type="profile.requested",
+                    actor_kind="system",
+                    actor_user_id=user.id,
+                    object_type="connection_profile",
+                    object_id=str(profile_result.profile.id),
+                    request_id=req,
+                    payload={"protocol": "wireguard", "reason": "initial_registration"},
+                )
+
+        row.user_id = user.id
+        row.consumed_at = now
+        result = _issue_session_for_user(
+            db, user=user, now=now, session_ttl_seconds=session_ttl_seconds
+        )
+        record_audit_event(
+            db,
+            event_type="auth.invite.redeemed",
+            actor_kind="user",
+            actor_user_id=user.id,
+            object_type="invite",
+            object_id=str(invite.id),
+            request_id=req,
+            payload={"email_hash": email_fingerprint(normalized)},
+        )
+        record_audit_event(
+            db,
+            event_type="auth.registration.completed",
+            actor_kind="user",
+            actor_user_id=user.id,
+            object_type="magic_link_token",
+            object_id=str(row.id),
+            request_id=req,
+            payload={"grant_created": grant is not None},
+        )
+    else:
+        raise MagicLinkRejected("invalid magic link")
+
     record_audit_event(
         db,
         event_type="auth.magic_link.consumed",
         actor_kind="user",
-        actor_user_id=user.id,
+        actor_user_id=result.session.user_id,
         object_type="magic_link_token",
         object_id=str(row.id),
         request_id=req,
-        payload={},
+        payload={"purpose": row.purpose},
     )
     record_audit_event(
         db,
         event_type="auth.session.created",
         actor_kind="user",
-        actor_user_id=user.id,
+        actor_user_id=result.session.user_id,
         object_type="auth_session",
-        object_id=str(session.id),
+        object_id=str(result.session.id),
         request_id=req,
         payload={},
     )
-    return SessionIssueResult(session=session, token=tok.raw)
-
+    return result
 
 def authenticate_session(db: Session, *, token: str) -> tuple[AuthSession, User]:
     digest = _sha256_text(str(token or ""))

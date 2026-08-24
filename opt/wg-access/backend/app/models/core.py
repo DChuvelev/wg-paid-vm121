@@ -117,6 +117,7 @@ class MagicLinkToken(Base):
     token_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    invite_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("invites.id", ondelete="CASCADE"), nullable=True, index=True)
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
