@@ -7,14 +7,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
-from app.models import AccessGrant, AuthSession, User
+from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, User
 from app.services.auth_v2 import (
     AuthV2Error,
     InviteRejected,
@@ -31,7 +31,13 @@ from app.services.auth_v2 import (
     request_id_or_new,
     revoke_session,
 )
-from app.services.domain_v2 import InvalidIdentity, record_audit_event, utcnow
+from app.services.domain_v2 import (
+    InvalidIdentity,
+    PROFILE_QUOTA_STATUSES,
+    grant_is_active,
+    record_audit_event,
+    utcnow,
+)
 
 from app.services.profile_delivery import (
     ProfileNotReady,
@@ -381,11 +387,19 @@ def consume_magic_link_route(
     return {"status": "authenticated"}
 
 
+class GrantProtocolLimitSummary(BaseModel):
+    protocol: str
+    profile_limit: int
+    profile_count: int
+    can_create: bool
+
+
 class GrantSummary(BaseModel):
     id: UUID
     status: str
     plan_id: UUID | None
     valid_until: datetime | None
+    protocol_limits: list[GrantProtocolLimitSummary]
 
 
 class AccountMeResponse(BaseModel):
@@ -404,11 +418,63 @@ def account_me(
     grants = db.execute(
         select(AccessGrant).where(AccessGrant.user_id == user.id).order_by(AccessGrant.created_at.asc())
     ).scalars().all()
+
+    limits_by_grant: dict[UUID, list[AccessGrantProtocolLimit]] = {}
+    usage_by_grant_protocol: dict[tuple[UUID, str], int] = {}
+    grant_ids = [g.id for g in grants]
+    if grant_ids:
+        limit_rows = db.execute(
+            select(AccessGrantProtocolLimit)
+            .where(AccessGrantProtocolLimit.access_grant_id.in_(grant_ids))
+            .order_by(
+                AccessGrantProtocolLimit.access_grant_id.asc(),
+                AccessGrantProtocolLimit.protocol.asc(),
+            )
+        ).scalars().all()
+        for row in limit_rows:
+            limits_by_grant.setdefault(row.access_grant_id, []).append(row)
+
+        usage_rows = db.execute(
+            select(
+                ConnectionProfile.access_grant_id,
+                ConnectionProfile.protocol,
+                func.count(ConnectionProfile.id),
+            )
+            .where(
+                ConnectionProfile.user_id == user.id,
+                ConnectionProfile.access_grant_id.in_(grant_ids),
+                ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+            )
+            .group_by(ConnectionProfile.access_grant_id, ConnectionProfile.protocol)
+        ).all()
+        usage_by_grant_protocol = {
+            (grant_id, protocol): int(count)
+            for grant_id, protocol, count in usage_rows
+        }
+
     return AccountMeResponse(
         user_id=user.id,
         email=user.email,
         grants=[
-            GrantSummary(id=g.id, status=g.status, plan_id=g.plan_id, valid_until=g.valid_until)
+            GrantSummary(
+                id=g.id,
+                status=g.status,
+                plan_id=g.plan_id,
+                valid_until=g.valid_until,
+                protocol_limits=[
+                    GrantProtocolLimitSummary(
+                        protocol=limit.protocol,
+                        profile_limit=limit.profile_limit,
+                        profile_count=usage_by_grant_protocol.get((g.id, limit.protocol), 0),
+                        can_create=(
+                            limit.protocol == "wireguard"
+                            and grant_is_active(g)
+                            and usage_by_grant_protocol.get((g.id, limit.protocol), 0) < limit.profile_limit
+                        ),
+                    )
+                    for limit in limits_by_grant.get(g.id, [])
+                ],
+            )
             for g in grants
         ],
     )
