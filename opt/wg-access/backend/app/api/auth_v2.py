@@ -6,7 +6,7 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -14,7 +14,7 @@ from app.config import settings
 from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
-from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, User
+from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, Plan, User
 from app.services.auth_v2 import (
     AuthV2Error,
     InviteRejected,
@@ -714,3 +714,309 @@ def account_profile_reissue(
         job_id=job.id,
         job_created=created,
     )
+
+# ---------------------------------------------------------------------------
+# Private Domain V2 admin surface.
+# These routes remain absent from the public VM103 proxy. The existing
+# X-Admin-Token authorization root stays authoritative; browser-specific admin
+# session UX belongs to the later private-admin ingress step.
+# ---------------------------------------------------------------------------
+
+class AdminPlanSummary(BaseModel):
+    id: UUID
+    code: str
+    display_name: str
+    active: bool
+    default_wireguard_limit: int
+    default_amneziawg_limit: int
+
+
+class AdminInviteSummary(BaseModel):
+    invite_id: UUID
+    intended_email: str | None
+    plan_id: UUID | None
+    max_uses: int
+    used_count: int
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+    state: str
+
+
+class AdminUserSummary(BaseModel):
+    user_id: UUID
+    email: str
+    email_verified_at: datetime
+    created_at: datetime
+    grants: list[GrantSummary]
+    profiles: list[ProfileSummary]
+
+
+class AdminProtocolLimitUpdateRequest(BaseModel):
+    profile_limit: int = Field(ge=0)
+
+
+class AdminProtocolLimitUpdateResponse(BaseModel):
+    access_grant_id: UUID
+    protocol: str
+    profile_limit: int
+    profile_count: int
+    can_create: bool
+
+
+def _admin_invite_state(invite: Invite, *, now: datetime | None = None) -> str:
+    point = now or utcnow()
+    if invite.revoked_at is not None:
+        return "revoked"
+    if invite.expires_at is not None and invite.expires_at <= point:
+        return "expired"
+    if invite.used_count >= invite.max_uses:
+        return "used"
+    return "active"
+
+
+def _admin_invite_summary(invite: Invite, *, now: datetime | None = None) -> AdminInviteSummary:
+    return AdminInviteSummary(
+        invite_id=invite.id,
+        intended_email=invite.intended_email,
+        plan_id=invite.plan_id,
+        max_uses=invite.max_uses,
+        used_count=invite.used_count,
+        expires_at=invite.expires_at,
+        revoked_at=invite.revoked_at,
+        created_at=invite.created_at,
+        state=_admin_invite_state(invite, now=now),
+    )
+
+
+def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
+    grants = db.execute(
+        select(AccessGrant)
+        .where(AccessGrant.user_id == user.id)
+        .order_by(AccessGrant.created_at.asc())
+    ).scalars().all()
+    grant_ids = [grant.id for grant in grants]
+    limits_by_grant: dict[UUID, list[AccessGrantProtocolLimit]] = {}
+    usage_by_grant_protocol: dict[tuple[UUID, str], int] = {}
+
+    if grant_ids:
+        limit_rows = db.execute(
+            select(AccessGrantProtocolLimit)
+            .where(AccessGrantProtocolLimit.access_grant_id.in_(grant_ids))
+            .order_by(
+                AccessGrantProtocolLimit.access_grant_id.asc(),
+                AccessGrantProtocolLimit.protocol.asc(),
+            )
+        ).scalars().all()
+        for row in limit_rows:
+            limits_by_grant.setdefault(row.access_grant_id, []).append(row)
+
+        usage_rows = db.execute(
+            select(
+                ConnectionProfile.access_grant_id,
+                ConnectionProfile.protocol,
+                func.count(ConnectionProfile.id),
+            )
+            .where(
+                ConnectionProfile.user_id == user.id,
+                ConnectionProfile.access_grant_id.in_(grant_ids),
+                ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+            )
+            .group_by(ConnectionProfile.access_grant_id, ConnectionProfile.protocol)
+        ).all()
+        usage_by_grant_protocol = {
+            (grant_id, protocol): int(count)
+            for grant_id, protocol, count in usage_rows
+        }
+
+    return [
+        GrantSummary(
+            id=grant.id,
+            status=grant.status,
+            plan_id=grant.plan_id,
+            valid_until=grant.valid_until,
+            protocol_limits=[
+                GrantProtocolLimitSummary(
+                    protocol=limit.protocol,
+                    profile_limit=limit.profile_limit,
+                    profile_count=usage_by_grant_protocol.get((grant.id, limit.protocol), 0),
+                    can_create=(
+                        limit.protocol == "wireguard"
+                        and grant_is_active(grant)
+                        and usage_by_grant_protocol.get((grant.id, limit.protocol), 0) < limit.profile_limit
+                    ),
+                )
+                for limit in limits_by_grant.get(grant.id, [])
+            ],
+        )
+        for grant in grants
+    ]
+
+
+@router.get(
+    "/admin/plans",
+    response_model=list[AdminPlanSummary],
+    dependencies=[Depends(_require_admin)],
+)
+def admin_list_plans(db: Session = Depends(get_db)):
+    rows = db.execute(select(Plan).order_by(Plan.created_at.asc())).scalars().all()
+    return [
+        AdminPlanSummary(
+            id=row.id,
+            code=row.code,
+            display_name=row.display_name,
+            active=row.active,
+            default_wireguard_limit=row.default_wireguard_limit,
+            default_amneziawg_limit=row.default_amneziawg_limit,
+        )
+        for row in rows
+    ]
+
+
+@router.get(
+    "/admin/invites",
+    response_model=list[AdminInviteSummary],
+    dependencies=[Depends(_require_admin)],
+)
+def admin_list_invites(db: Session = Depends(get_db)):
+    rows = db.execute(select(Invite).order_by(Invite.created_at.desc())).scalars().all()
+    point = utcnow()
+    return [_admin_invite_summary(row, now=point) for row in rows]
+
+
+@router.post(
+    "/admin/invites/{invite_id}/revoke",
+    response_model=AdminInviteSummary,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_revoke_invite(
+    invite_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    invite = db.execute(
+        select(Invite).where(Invite.id == invite_id).with_for_update()
+    ).scalar_one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=404, detail="invite not found")
+    now = utcnow()
+    if invite.revoked_at is None:
+        invite.revoked_at = now
+        record_audit_event(
+            db,
+            event_type="auth.invite.revoked",
+            actor_kind="admin",
+            object_type="invite",
+            object_id=str(invite.id),
+            request_id=_request_id(request),
+            payload={"used_count": invite.used_count, "max_uses": invite.max_uses},
+        )
+    db.commit()
+    db.refresh(invite)
+    return _admin_invite_summary(invite, now=now)
+
+
+@router.get(
+    "/admin/users",
+    response_model=list[AdminUserSummary],
+    dependencies=[Depends(_require_admin)],
+)
+def admin_list_users(
+    email: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    bounded_limit = min(max(int(limit), 1), 200)
+    stmt = select(User).order_by(User.created_at.desc())
+    if email is not None and str(email).strip():
+        stmt = stmt.where(User.email == str(email).strip().casefold())
+    users = db.execute(stmt.limit(bounded_limit)).scalars().all()
+    result: list[AdminUserSummary] = []
+    for user in users:
+        profiles = db.execute(
+            select(ConnectionProfile)
+            .where(ConnectionProfile.user_id == user.id)
+            .order_by(ConnectionProfile.created_at.asc())
+        ).scalars().all()
+        result.append(
+            AdminUserSummary(
+                user_id=user.id,
+                email=user.email,
+                email_verified_at=user.email_verified_at,
+                created_at=user.created_at,
+                grants=_admin_grant_summaries(db, user=user),
+                profiles=[_profile_summary(profile) for profile in profiles],
+            )
+        )
+    return result
+
+
+@router.put(
+    "/admin/grants/{grant_id}/protocol-limits/{protocol}",
+    response_model=AdminProtocolLimitUpdateResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_set_protocol_limit(
+    grant_id: UUID,
+    protocol: str,
+    payload: AdminProtocolLimitUpdateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    if protocol not in {"wireguard", "amneziawg"}:
+        raise HTTPException(status_code=400, detail="unsupported protocol")
+    grant = db.execute(
+        select(AccessGrant).where(AccessGrant.id == grant_id).with_for_update()
+    ).scalar_one_or_none()
+    if grant is None:
+        raise HTTPException(status_code=404, detail="grant not found")
+    limit_row = db.execute(
+        select(AccessGrantProtocolLimit)
+        .where(
+            AccessGrantProtocolLimit.access_grant_id == grant.id,
+            AccessGrantProtocolLimit.protocol == protocol,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if limit_row is None:
+        raise HTTPException(status_code=404, detail="protocol limit not found")
+
+    prior_limit = int(limit_row.profile_limit)
+    limit_row.profile_limit = int(payload.profile_limit)
+    current_count = int(
+        db.execute(
+            select(func.count(ConnectionProfile.id)).where(
+                ConnectionProfile.access_grant_id == grant.id,
+                ConnectionProfile.protocol == protocol,
+                ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+            )
+        ).scalar_one()
+    )
+    record_audit_event(
+        db,
+        event_type="grant.protocol_limit.updated",
+        actor_kind="admin",
+        object_type="access_grant",
+        object_id=str(grant.id),
+        request_id=_request_id(request),
+        payload={
+            "protocol": protocol,
+            "prior_profile_limit": prior_limit,
+            "profile_limit": int(payload.profile_limit),
+            "profile_count": current_count,
+        },
+    )
+    db.commit()
+    db.refresh(limit_row)
+    return AdminProtocolLimitUpdateResponse(
+        access_grant_id=grant.id,
+        protocol=protocol,
+        profile_limit=int(limit_row.profile_limit),
+        profile_count=current_count,
+        can_create=(
+            protocol == "wireguard"
+            and grant_is_active(grant)
+            and current_count < int(limit_row.profile_limit)
+        ),
+    )
+
