@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import base64
+import hashlib
+import hmac
 import secrets
+import time
 from typing import Literal
 from uuid import UUID
 
@@ -11,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches
+from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches, load_admin_token
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
 from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, Plan, User
@@ -56,6 +60,10 @@ router = APIRouter(prefix="/v2", tags=["domain-v2-auth"])
 SESSION_COOKIE = "wg_access_session"
 CSRF_COOKIE = "wg_access_csrf"
 CSRF_HEADER = "x-csrf-token"
+ADMIN_SESSION_COOKIE = "wg_admin_session"
+ADMIN_CSRF_COOKIE = "wg_admin_csrf"
+ADMIN_CSRF_HEADER = "x-admin-csrf-token"
+ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 GENERIC_LOGIN_RESPONSE = {"status": "accepted"}
 
 
@@ -73,13 +81,85 @@ def _require_external_onboarding() -> None:
         raise HTTPException(status_code=404, detail="not found")
 
 
-def _require_admin(x_admin_token: str | None = Header(default=None)) -> None:
+def _admin_session_signature(body: str) -> str:
     try:
-        matched = admin_token_matches(x_admin_token)
+        secret = load_admin_token().encode("utf-8")
     except AdminAuthorizationUnavailable as exc:
         raise HTTPException(status_code=503, detail="admin authorization is not configured") from exc
-    if not matched:
+    digest = hmac.new(secret, body.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _issue_admin_session_token() -> str:
+    expires_at = int(time.time()) + ADMIN_SESSION_TTL_SECONDS
+    nonce = secrets.token_urlsafe(24)
+    body = f"v1.{expires_at}.{nonce}"
+    return f"{body}.{_admin_session_signature(body)}"
+
+
+def _admin_session_is_valid(token: str | None) -> bool:
+    if not token:
+        return False
+    try:
+        version, expires_text, nonce, signature = token.split(".", 3)
+        expires_at = int(expires_text)
+    except (TypeError, ValueError):
+        return False
+    if version != "v1" or not nonce or expires_at <= int(time.time()):
+        return False
+    body = f"{version}.{expires_at}.{nonce}"
+    expected = _admin_session_signature(body)
+    return secrets.compare_digest(signature, expected)
+
+
+def _require_admin(
+    request: Request,
+    x_admin_token: str | None = Header(default=None),
+    wg_admin_session: str | None = Cookie(default=None),
+    wg_admin_csrf: str | None = Cookie(default=None),
+) -> None:
+    if x_admin_token is not None:
+        try:
+            matched = admin_token_matches(x_admin_token)
+        except AdminAuthorizationUnavailable as exc:
+            raise HTTPException(status_code=503, detail="admin authorization is not configured") from exc
+        if not matched:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        return
+
+    if not _admin_session_is_valid(wg_admin_session):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+        header = request.headers.get(ADMIN_CSRF_HEADER)
+        if not wg_admin_csrf or not header or not secrets.compare_digest(wg_admin_csrf, header):
+            raise HTTPException(status_code=403, detail="admin csrf validation failed")
+
+
+def _set_admin_session_cookies(response: Response, *, session_token: str, csrf_token: str) -> None:
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        session_token,
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
+    response.set_cookie(
+        ADMIN_CSRF_COOKIE,
+        csrf_token,
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+        httponly=False,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
+
+
+def _clear_admin_session_cookies(response: Response) -> None:
+    response.delete_cookie(ADMIN_SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    response.delete_cookie(ADMIN_CSRF_COOKIE, path="/", secure=True, httponly=False, samesite="strict")
 
 
 def _session_cookie_value(wg_access_session: str | None = Cookie(default=None)) -> str:
@@ -131,6 +211,42 @@ def _set_session_cookies(response: Response, *, session_token: str, csrf_token: 
 def _clear_session_cookies(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
     response.delete_cookie(CSRF_COOKIE, path="/", secure=True, httponly=False, samesite="lax")
+
+
+class AdminSessionLoginRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=4096)
+
+
+@router.post("/admin/session/login")
+def admin_session_login(payload: AdminSessionLoginRequest, response: Response):
+    try:
+        matched = admin_token_matches(payload.token)
+    except AdminAuthorizationUnavailable as exc:
+        raise HTTPException(status_code=503, detail="admin authorization is not configured") from exc
+    if not matched:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    session_token = _issue_admin_session_token()
+    csrf_token = secrets.token_urlsafe(24)
+    _set_admin_session_cookies(response, session_token=session_token, csrf_token=csrf_token)
+    return {"status": "authenticated", "expires_in": ADMIN_SESSION_TTL_SECONDS}
+
+
+@router.get(
+    "/admin/session",
+    dependencies=[Depends(_require_admin)],
+)
+def admin_session_status():
+    return {"authenticated": True}
+
+
+@router.post(
+    "/admin/session/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_session_logout(response: Response):
+    _clear_admin_session_cookies(response)
+    return None
 
 
 class AdminInviteRequest(BaseModel):
