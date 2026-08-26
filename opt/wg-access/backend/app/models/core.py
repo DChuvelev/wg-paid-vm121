@@ -27,6 +27,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False, index=True, unique=True)
     email_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    deletion_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     orders: Mapped[list["Order"]] = relationship(back_populates="user")
     peers: Mapped[list["Peer"]] = relationship(back_populates="user")

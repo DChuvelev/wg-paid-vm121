@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db.session import get_db
 from app.models import ConnectionProfile, Peer, PeerCredential, ProvisioningJob
+from app.services.user_deletion import finalize_user_deletion_if_ready
 from app.services.credential_service import CredentialServiceError, decrypt_profile_credential
 from app.services.domain_v2 import (
     DomainV2Error,
@@ -179,13 +180,26 @@ def complete_job(
     except DomainV2Error as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    profile_user_id = None
+    if job.connection_profile_id is not None:
+        profile = db.get(ConnectionProfile, job.connection_profile_id)
+        if profile is not None:
+            profile_user_id = profile.user_id
+
     job.status = "completed"
     job.completed_at = datetime.now(timezone.utc)
     job.next_attempt_at = None
     job.last_error = None
     db.commit()
     db.refresh(job)
-    return job
+    response = AgentJobResponse.model_validate(job)
+
+    if profile_user_id is not None:
+        if finalize_user_deletion_if_ready(db, user_id=profile_user_id):
+            db.commit()
+        else:
+            db.rollback()
+    return response
 
 
 @router.post("/jobs/{job_id}/fail", response_model=AgentJobResponse)

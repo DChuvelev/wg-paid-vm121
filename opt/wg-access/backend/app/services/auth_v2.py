@@ -282,7 +282,7 @@ def issue_magic_link_for_email(
         request_id=req,
         payload={"email_hash": email_fingerprint(normalized)},
     )
-    if user is None:
+    if user is None or user.deletion_requested_at is not None:
         return MagicLinkIssueResult(row=None, token=None)
 
     now = utcnow()
@@ -371,7 +371,7 @@ def consume_magic_link(
         if row.user_id is None or row.invite_id is not None:
             raise MagicLinkRejected("invalid magic link")
         user = db.get(User, row.user_id)
-        if user is None or user.email_verified_at is None:
+        if user is None or user.email_verified_at is None or user.deletion_requested_at is not None:
             raise MagicLinkRejected("invalid magic link")
         row.consumed_at = now
         result = _issue_session_for_user(
@@ -501,7 +501,7 @@ def authenticate_session(db: Session, *, token: str) -> tuple[AuthSession, User]
     if session is None or session.revoked_at is not None or session.expires_at <= now:
         raise SessionRejected("invalid session")
     user = db.get(User, session.user_id)
-    if user is None:
+    if user is None or user.deletion_requested_at is not None:
         raise SessionRejected("invalid session")
     return session, user
 

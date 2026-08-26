@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches, load_admin_token
+from app.agent_trigger import trigger_wg_access_agent_best_effort
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
 from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, Plan, User
@@ -42,6 +43,8 @@ from app.services.domain_v2 import (
     record_audit_event,
     utcnow,
 )
+
+from app.services.user_deletion import UserDeletionError, request_admin_user_deletion
 
 from app.services.profile_delivery import (
     ProfileNotReady,
@@ -874,8 +877,18 @@ class AdminUserSummary(BaseModel):
     email: str
     email_verified_at: datetime
     created_at: datetime
+    deletion_requested_at: datetime | None
     grants: list[GrantSummary]
     profiles: list[ProfileSummary]
+
+
+class AdminUserDeleteResponse(BaseModel):
+    user_id: UUID
+    email: str
+    status: Literal["deleting", "deleted", "blocked_legacy_dependencies"]
+    disable_jobs_created: int
+    remaining_profiles: int
+    legacy_dependency_count: int
 
 
 class AdminProtocolLimitUpdateRequest(BaseModel):
@@ -1070,11 +1083,45 @@ def admin_list_users(
                 email=user.email,
                 email_verified_at=user.email_verified_at,
                 created_at=user.created_at,
+                deletion_requested_at=user.deletion_requested_at,
                 grants=_admin_grant_summaries(db, user=user),
                 profiles=[_profile_summary(profile) for profile in profiles],
             )
         )
     return result
+
+
+@router.delete(
+    "/admin/users/{user_id}",
+    response_model=AdminUserDeleteResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_delete_user(
+    user_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    try:
+        result = request_admin_user_deletion(
+            db,
+            user_id=user_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+    except UserDeletionError as exc:
+        db.rollback()
+        if str(exc) == "user not found":
+            raise HTTPException(status_code=404, detail="user not found") from exc
+        raise HTTPException(status_code=409, detail="user cannot be deleted") from exc
+    trigger_wg_access_agent_best_effort()
+    return AdminUserDeleteResponse(
+        user_id=result.user_id,
+        email=result.email,
+        status=result.status,
+        disable_jobs_created=result.disable_jobs_created,
+        remaining_profiles=result.remaining_profiles,
+        legacy_dependency_count=result.legacy_dependency_count,
+    )
 
 
 @router.put(
