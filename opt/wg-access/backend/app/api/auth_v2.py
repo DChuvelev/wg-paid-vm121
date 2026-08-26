@@ -717,6 +717,12 @@ def account_profile_config(
             profile_id=profile_id,
             request_id=_request_id(request),
         )
+        profile_ordinal = next(
+            (index for index, owned in enumerate(list_owned_profiles(db, user=user), start=1) if owned.id == profile_id),
+            0,
+        )
+        if profile_ordinal == 0:
+            raise ProfileUnavailable("profile unavailable")
         db.commit()
     except ProfileUnavailable as exc:
         db.rollback()
@@ -727,7 +733,7 @@ def account_profile_config(
     response = Response(
         content=config_text,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="wireguard-{profile_id}.conf"'},
+        headers={"Content-Disposition": f'attachment; filename="SecretStudio-{profile_ordinal:02d}.conf"'},
     )
     _private_no_store(response)
     return response
