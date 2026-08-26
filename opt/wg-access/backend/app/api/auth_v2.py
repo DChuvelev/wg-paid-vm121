@@ -724,7 +724,11 @@ def account_profile_config(
     except ProfileNotReady as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="profile is not ready") from exc
-    response = Response(content=config_text, media_type="text/plain; charset=utf-8")
+    response = Response(
+        content=config_text,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="wireguard-{profile_id}.conf"'},
+    )
     _private_no_store(response)
     return response
 
