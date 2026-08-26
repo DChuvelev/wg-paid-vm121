@@ -86,7 +86,7 @@ def build_client_config(private_key: str, tunnel_ip: str, preshared_key: str) ->
     server_public_key = os.environ.get("WG_SERVER_PUBLIC_KEY", "").strip()
     endpoint = os.environ.get("WG_CLIENT_ENDPOINT", "").strip()
     allowed_ips = os.environ.get("WG_CLIENT_ALLOWED_IPS", "10.253.1.1/32").strip()
-    dns = os.environ.get("WG_CLIENT_DNS", "").strip()
+    dns = os.environ.get("WG_CLIENT_DNS", "10.253.1.1").strip()
 
     if not server_public_key:
         raise RuntimeError("WG_SERVER_PUBLIC_KEY is not configured")
