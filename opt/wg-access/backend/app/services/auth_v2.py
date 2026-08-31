@@ -73,6 +73,7 @@ class MagicLinkIssueResult:
 class SessionIssueResult:
     session: AuthSession
     token: str
+    agent_wakeup_needed: bool = False
 
 
 def _sha256_text(value: str) -> str:
@@ -366,6 +367,7 @@ def consume_magic_link(
         raise MagicLinkRejected("invalid magic link")
 
     req = request_id_or_new(request_id)
+    agent_wakeup_needed = False
 
     if row.purpose == "login":
         if row.user_id is None or row.invite_id is not None:
@@ -431,6 +433,8 @@ def consume_magic_link(
                     label=None,
                     now=now,
                 )
+                if profile_result.created_job:
+                    agent_wakeup_needed = True
                 record_audit_event(
                     db,
                     event_type="profile.requested",
@@ -490,7 +494,11 @@ def consume_magic_link(
         request_id=req,
         payload={},
     )
-    return result
+    return SessionIssueResult(
+        session=result.session,
+        token=result.token,
+        agent_wakeup_needed=agent_wakeup_needed,
+    )
 
 def authenticate_session(db: Session, *, token: str) -> tuple[AuthSession, User]:
     digest = _sha256_text(str(token or ""))

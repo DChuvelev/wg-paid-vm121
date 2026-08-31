@@ -489,6 +489,8 @@ def consume_magic_link_route(
             request_id=req,
         )
         db.commit()
+        if result.agent_wakeup_needed:
+            trigger_wg_access_agent_best_effort()
     except MagicLinkRejected as exc:
         db.rollback()
         record_audit_event(
@@ -694,6 +696,7 @@ def account_profile_create(
         )
         db.commit()
         db.refresh(result.profile)
+        trigger_wg_access_agent_best_effort()
     except ProfileSurfaceError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail="profile cannot be created") from exc
@@ -796,6 +799,7 @@ def account_profile_revoke(
         )
         db.commit()
         db.refresh(profile)
+        trigger_wg_access_agent_best_effort()
     except ProfileUnavailable as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail="profile not found") from exc
@@ -832,6 +836,7 @@ def account_profile_reissue(
         )
         db.commit()
         db.refresh(profile)
+        trigger_wg_access_agent_best_effort()
     except ProfileUnavailable as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail="profile not found") from exc
