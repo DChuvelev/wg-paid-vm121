@@ -37,10 +37,12 @@ from app.services.auth_v2 import (
     revoke_session,
 )
 from app.services.domain_v2 import (
+    DomainV2Error,
     InvalidIdentity,
     PROFILE_QUOTA_STATUSES,
     grant_is_active,
     record_audit_event,
+    request_profile_disable,
     utcnow,
 )
 
@@ -54,8 +56,6 @@ from app.services.profile_delivery import (
     build_qr_svg,
     create_owned_profile,
     list_owned_profiles,
-    reissue_owned_profile,
-    revoke_owned_profile,
 )
 
 router = APIRouter(prefix="/v2", tags=["domain-v2-auth"])
@@ -626,6 +626,7 @@ def _private_no_store(response: Response) -> None:
 
 class ProfileSummary(BaseModel):
     id: UUID
+    access_grant_id: UUID
     protocol: str
     status: str
     tunnel_ip: str | None
@@ -649,6 +650,7 @@ class ProfileCreateRequest(BaseModel):
 def _profile_summary(profile) -> ProfileSummary:
     return ProfileSummary(
         id=profile.id,
+        access_grant_id=profile.access_grant_id,
         protocol=profile.protocol,
         status=profile.status,
         tunnel_ip=profile.tunnel_ip,
@@ -666,7 +668,11 @@ def account_profiles(
 ):
     _, user = current
     rows = list_owned_profiles(db, user=user)
-    return [_profile_summary(row) for row in rows]
+    return [
+        _profile_summary(row)
+        for row in rows
+        if row.status in PROFILE_QUOTA_STATUSES
+    ]
 
 
 @router.post(
@@ -776,79 +782,6 @@ def account_profile_qr(
     return response
 
 
-@router.post(
-    "/account/profiles/{profile_id}/revoke",
-    response_model=ProfileMutationResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def account_profile_revoke(
-    profile_id: UUID,
-    request: Request,
-    current: tuple[AuthSession, User] = Depends(_current_session),
-    db: Session = Depends(get_db),
-    _: None = Depends(_require_external_onboarding),
-    __: None = Depends(_require_csrf),
-):
-    _, user = current
-    try:
-        profile, job, created = revoke_owned_profile(
-            db,
-            user=user,
-            profile_id=profile_id,
-            request_id=_request_id(request),
-        )
-        db.commit()
-        db.refresh(profile)
-        trigger_wg_access_agent_best_effort()
-    except ProfileUnavailable as exc:
-        db.rollback()
-        raise HTTPException(status_code=404, detail="profile not found") from exc
-    except ProfileSurfaceError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="profile cannot be revoked") from exc
-    return ProfileMutationResponse(
-        profile=_profile_summary(profile),
-        job_id=job.id,
-        job_created=created,
-    )
-
-
-@router.post(
-    "/account/profiles/{profile_id}/reissue",
-    response_model=ProfileMutationResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def account_profile_reissue(
-    profile_id: UUID,
-    request: Request,
-    current: tuple[AuthSession, User] = Depends(_current_session),
-    db: Session = Depends(get_db),
-    _: None = Depends(_require_external_onboarding),
-    __: None = Depends(_require_csrf),
-):
-    _, user = current
-    try:
-        profile, job, created = reissue_owned_profile(
-            db,
-            user=user,
-            profile_id=profile_id,
-            request_id=_request_id(request),
-        )
-        db.commit()
-        db.refresh(profile)
-        trigger_wg_access_agent_best_effort()
-    except ProfileUnavailable as exc:
-        db.rollback()
-        raise HTTPException(status_code=404, detail="profile not found") from exc
-    except ProfileSurfaceError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="profile cannot be reissued") from exc
-    return ProfileMutationResponse(
-        profile=_profile_summary(profile),
-        job_id=job.id,
-        job_created=created,
-    )
-
 # ---------------------------------------------------------------------------
 # Private Domain V2 admin surface.
 # These routes remain absent from the public VM103 proxy. The existing
@@ -898,6 +831,7 @@ class AdminUserDeleteResponse(BaseModel):
 
 class AdminProtocolLimitUpdateRequest(BaseModel):
     profile_limit: int = Field(ge=0)
+    retire_profile_ids: list[UUID] = Field(default_factory=list)
 
 
 class AdminProtocolLimitUpdateResponse(BaseModel):
@@ -906,6 +840,9 @@ class AdminProtocolLimitUpdateResponse(BaseModel):
     profile_limit: int
     profile_count: int
     can_create: bool
+    retire_profile_ids: list[UUID]
+    disable_jobs_created: int
+    retirement_in_progress: bool
 
 
 def _admin_invite_state(invite: Invite, *, now: datetime | None = None) -> str:
@@ -1160,32 +1097,97 @@ def admin_set_protocol_limit(
         raise HTTPException(status_code=404, detail="protocol limit not found")
 
     prior_limit = int(limit_row.profile_limit)
-    limit_row.profile_limit = int(payload.profile_limit)
-    current_count = int(
-        db.execute(
-            select(func.count(ConnectionProfile.id)).where(
-                ConnectionProfile.access_grant_id == grant.id,
-                ConnectionProfile.protocol == protocol,
-                ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+    new_limit = int(payload.profile_limit)
+    selected_ids = list(payload.retire_profile_ids)
+    if len(set(selected_ids)) != len(selected_ids):
+        raise HTTPException(status_code=400, detail="duplicate retirement profile ids")
+
+    quota_profiles = db.execute(
+        select(ConnectionProfile)
+        .where(
+            ConnectionProfile.access_grant_id == grant.id,
+            ConnectionProfile.protocol == protocol,
+            ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+        )
+        .order_by(ConnectionProfile.created_at.asc(), ConnectionProfile.id.asc())
+        .with_for_update()
+    ).scalars().all()
+    current_count = len(quota_profiles)
+    required_reduction = max(0, current_count - new_limit)
+
+    if required_reduction == 0:
+        if selected_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="retirement profile ids are not allowed when no reduction is required",
             )
-        ).scalar_one()
-    )
+    else:
+        if protocol != "wireguard":
+            raise HTTPException(
+                status_code=409,
+                detail="profile retirement is not supported for this protocol",
+            )
+        if len(selected_ids) != required_reduction:
+            raise HTTPException(
+                status_code=409,
+                detail=f"exactly {required_reduction} profile(s) must be selected for retirement",
+            )
+        eligible_ids = {profile.id for profile in quota_profiles}
+        if any(profile_id not in eligible_ids for profile_id in selected_ids):
+            raise HTTPException(
+                status_code=409,
+                detail="selected profiles must belong to this grant/protocol and consume quota",
+            )
+
+    disable_jobs_created = 0
+    req = _request_id(request)
+    for profile_id in selected_ids:
+        try:
+            profile, job, created = request_profile_disable(db, profile_id=profile_id)
+        except DomainV2Error as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="selected profile cannot be retired in its current state",
+            ) from exc
+        disable_jobs_created += int(created)
+        record_audit_event(
+            db,
+            event_type="profile.retirement.requested",
+            actor_kind="admin",
+            object_type="connection_profile",
+            object_id=str(profile.id),
+            request_id=req,
+            payload={
+                "access_grant_id": str(grant.id),
+                "protocol": protocol,
+                "job_id": str(job.id),
+                "job_created": bool(created),
+            },
+        )
+
+    limit_row.profile_limit = new_limit
     record_audit_event(
         db,
         event_type="grant.protocol_limit.updated",
         actor_kind="admin",
         object_type="access_grant",
         object_id=str(grant.id),
-        request_id=_request_id(request),
+        request_id=req,
         payload={
             "protocol": protocol,
             "prior_profile_limit": prior_limit,
-            "profile_limit": int(payload.profile_limit),
-            "profile_count": current_count,
+            "profile_limit": new_limit,
+            "profile_count_before": current_count,
+            "required_reduction": required_reduction,
+            "retire_profile_ids": [str(profile_id) for profile_id in selected_ids],
+            "disable_jobs_created": disable_jobs_created,
         },
     )
     db.commit()
     db.refresh(limit_row)
+    if selected_ids:
+        trigger_wg_access_agent_best_effort()
     return AdminProtocolLimitUpdateResponse(
         access_grant_id=grant.id,
         protocol=protocol,
@@ -1196,5 +1198,8 @@ def admin_set_protocol_limit(
             and grant_is_active(grant)
             and current_count < int(limit_row.profile_limit)
         ),
+        retire_profile_ids=selected_ids,
+        disable_jobs_created=disable_jobs_created,
+        retirement_in_progress=bool(selected_ids),
     )
 
