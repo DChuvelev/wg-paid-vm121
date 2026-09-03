@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -196,6 +197,36 @@ def remote_command(script, stdin_text=None, *, log_output=True):
     return stdout
 
 
+LIFECYCLE_LOCK_RETRY_DELAYS_SEC = (0.2, 0.4, 0.8, 1.2, 1.8, 2.6)
+LIFECYCLE_LOCK_RC_MARKER = "remote command failed rc=75:"
+LIFECYCLE_LOCK_RESULT_MARKER = "RESULT=NOOP_PEER_LIFECYCLE_LOCKED"
+
+
+def remote_lifecycle_command(script, stdin_text, *, operation):
+    max_attempts = len(LIFECYCLE_LOCK_RETRY_DELAYS_SEC) + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return remote_command(script, stdin_text)
+        except RuntimeError as exc:
+            message = str(exc)
+            lock_contention = (
+                LIFECYCLE_LOCK_RC_MARKER in message
+                and LIFECYCLE_LOCK_RESULT_MARKER in message
+            )
+            if not lock_contention or attempt >= max_attempts:
+                raise
+
+            delay = LIFECYCLE_LOCK_RETRY_DELAYS_SEC[attempt - 1]
+            log(
+                "VM100 lifecycle lock contention "
+                f"operation={operation} attempt={attempt}/{max_attempts} "
+                f"retry_in={delay:.1f}s"
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("unreachable lifecycle retry state")
+
+
 def desired_generation(peer):
     material = "|".join([
         str(peer["id"]),
@@ -317,7 +348,11 @@ IFS= read -r preshared_key
 printf '%s\n' "$preshared_key" > "$psk"
 ''' + shlex.quote(REMOTE_LIFECYCLE_COMMAND) + " " + mode + ' "$req" "$psk"\n'
 
-    out = remote_command(script, stdin_text)
+    out = remote_lifecycle_command(
+        script,
+        stdin_text,
+        operation=f"{mode} peer_id={peer['id']} tunnel_ip={peer['tunnel_ip']}",
+    )
     accepted = (
         "RESULT=PASS_PEER_ENABLE" in out
         or "RESULT=PASS_PEER_RUNTIME_ENSURE" in out
@@ -353,7 +388,11 @@ IFS= read -r desired_generation
 } > "$req"
 ''' + shlex.quote(REMOTE_LIFECYCLE_COMMAND) + ' --disable "$req"\n'
 
-    out = remote_command(script, stdin_text)
+    out = remote_lifecycle_command(
+        script,
+        stdin_text,
+        operation=f"--disable profile_id={profile_id}",
+    )
     accepted = (
         "RESULT=PASS_PEER_DISABLE" in out
         or "result=PASS_PEER_DISABLE" in out
