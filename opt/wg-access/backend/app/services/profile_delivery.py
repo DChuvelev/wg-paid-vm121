@@ -100,6 +100,32 @@ def create_owned_profile(
     return result
 
 
+def update_owned_profile_label(
+    db: Session,
+    *,
+    user,
+    profile_id: uuid.UUID,
+    label: str | None,
+    request_id: str | None,
+) -> ConnectionProfile:
+    profile = _owned_profile(db, user_id=user.id, profile_id=profile_id, for_update=True)
+    normalized = str(label).strip() if label is not None else ""
+    profile.label = normalized or None
+    profile.updated_at = utcnow()
+    record_audit_event(
+        db,
+        event_type="profile.label.updated",
+        actor_kind="user",
+        actor_user_id=user.id,
+        object_type="connection_profile",
+        object_id=str(profile.id),
+        request_id=request_id,
+        payload={"label_set": profile.label is not None},
+    )
+    db.flush()
+    return profile
+
+
 def build_owned_wireguard_config(
     db: Session,
     *,

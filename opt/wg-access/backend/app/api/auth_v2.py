@@ -56,6 +56,7 @@ from app.services.profile_delivery import (
     build_qr_svg,
     create_owned_profile,
     list_owned_profiles,
+    update_owned_profile_label,
 )
 
 router = APIRouter(prefix="/v2", tags=["domain-v2-auth"])
@@ -529,16 +530,15 @@ class GrantSummary(BaseModel):
 class AccountMeResponse(BaseModel):
     user_id: UUID
     email: str
+    display_name: str | None
     grants: list[GrantSummary]
 
 
-@router.get("/account/me", response_model=AccountMeResponse)
-def account_me(
-    current: tuple[AuthSession, User] = Depends(_current_session),
-    db: Session = Depends(get_db),
-    _: None = Depends(_require_external_onboarding),
-):
-    _, user = current
+class AccountMetadataUpdateRequest(BaseModel):
+    display_name: str | None = Field(max_length=160)
+
+
+def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
     grants = db.execute(
         select(AccessGrant).where(AccessGrant.user_id == user.id).order_by(AccessGrant.created_at.asc())
     ).scalars().all()
@@ -579,6 +579,7 @@ def account_me(
     return AccountMeResponse(
         user_id=user.id,
         email=user.email,
+        display_name=user.display_name,
         grants=[
             GrantSummary(
                 id=g.id,
@@ -602,6 +603,43 @@ def account_me(
             for g in grants
         ],
     )
+
+
+@router.get("/account/me", response_model=AccountMeResponse)
+def account_me(
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    return _account_me_response(db, user=user)
+
+
+@router.patch("/account/me", response_model=AccountMeResponse)
+def account_me_update(
+    payload: AccountMetadataUpdateRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    normalized = str(payload.display_name).strip() if payload.display_name is not None else ""
+    user.display_name = normalized or None
+    record_audit_event(
+        db,
+        event_type="account.display_name.updated",
+        actor_kind="user",
+        actor_user_id=user.id,
+        object_type="user",
+        object_id=str(user.id),
+        request_id=_request_id(request),
+        payload={"display_name_set": user.display_name is not None},
+    )
+    db.commit()
+    db.refresh(user)
+    return _account_me_response(db, user=user)
 
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -647,7 +685,11 @@ class ProfileMutationResponse(BaseModel):
 class ProfileCreateRequest(BaseModel):
     grant_id: UUID
     protocol: Literal["wireguard"] = "wireguard"
-    label: str | None = None
+    label: str | None = Field(default=None, max_length=160)
+
+
+class ProfileLabelUpdateRequest(BaseModel):
+    label: str | None = Field(max_length=160)
 
 
 def _profile_summary(profile) -> ProfileSummary:
@@ -700,7 +742,7 @@ def account_profile_create(
             grant_id=payload.grant_id,
             protocol=payload.protocol,
             node_id=settings.wg_default_node_id,
-            label=payload.label,
+            label=(str(payload.label).strip() or None) if payload.label is not None else None,
             request_id=req,
         )
         db.commit()
@@ -714,6 +756,33 @@ def account_profile_create(
         job_id=result.job.id,
         job_created=result.created_job,
     )
+
+
+@router.patch("/account/profiles/{profile_id}", response_model=ProfileSummary)
+def account_profile_update_label(
+    profile_id: UUID,
+    payload: ProfileLabelUpdateRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        profile = update_owned_profile_label(
+            db,
+            user=user,
+            profile_id=profile_id,
+            label=payload.label,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(profile)
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile unavailable") from exc
+    return _profile_summary(profile)
 
 
 @router.get("/account/profiles/{profile_id}/config")
@@ -819,6 +888,8 @@ class AdminInviteSummary(BaseModel):
 class AdminUserSummary(BaseModel):
     user_id: UUID
     email: str
+    display_name: str | None
+    admin_note: str | None
     email_verified_at: datetime
     created_at: datetime
     deletion_requested_at: datetime | None
@@ -830,6 +901,16 @@ class AdminUserSummary(BaseModel):
     invited_by_label: str | None
     grants: list[GrantSummary]
     profiles: list[ProfileSummary]
+
+
+class AdminUserMetadataUpdateRequest(BaseModel):
+    admin_note: str | None = Field(max_length=4000)
+
+
+class AdminUserMetadataUpdateResponse(BaseModel):
+    user_id: UUID
+    display_name: str | None
+    admin_note: str | None
 
 
 class AdminUserDeleteResponse(BaseModel):
@@ -1023,6 +1104,7 @@ def admin_list_users(
     offset: int = 0,
     sort_by: Literal[
         "email",
+        "display_name",
         "created_at",
         "invite_issued_at",
         "invite_redeemed_at",
@@ -1062,6 +1144,7 @@ def admin_list_users(
 
     sort_columns = {
         "email": User.email,
+        "display_name": func.lower(User.display_name),
         "created_at": User.created_at,
         "invite_issued_at": Invite.created_at,
         "invite_redeemed_at": registration_ranked.c.redeemed_at,
@@ -1094,6 +1177,8 @@ def admin_list_users(
             AdminUserSummary(
                 user_id=user.id,
                 email=user.email,
+                display_name=user.display_name,
+                admin_note=user.admin_note,
                 email_verified_at=user.email_verified_at,
                 created_at=user.created_at,
                 deletion_requested_at=user.deletion_requested_at,
@@ -1108,6 +1193,43 @@ def admin_list_users(
             )
         )
     return result
+
+
+@router.patch(
+    "/admin/users/{user_id}",
+    response_model=AdminUserMetadataUpdateResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_update_user_metadata(
+    user_id: UUID,
+    payload: AdminUserMetadataUpdateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    user = db.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    normalized = str(payload.admin_note).strip() if payload.admin_note is not None else ""
+    user.admin_note = normalized or None
+    record_audit_event(
+        db,
+        event_type="admin.user_note.updated",
+        actor_kind="admin",
+        actor_user_id=None,
+        object_type="user",
+        object_id=str(user.id),
+        request_id=_request_id(request),
+        payload={"admin_note_set": user.admin_note is not None},
+    )
+    db.commit()
+    db.refresh(user)
+    return AdminUserMetadataUpdateResponse(
+        user_id=user.id,
+        display_name=user.display_name,
+        admin_note=user.admin_note,
+    )
 
 
 @router.delete(
