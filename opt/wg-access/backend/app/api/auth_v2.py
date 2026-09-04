@@ -19,7 +19,7 @@ from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_m
 from app.agent_trigger import trigger_wg_access_agent_best_effort
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
-from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, Plan, User
+from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, InviteRedemption, Plan, User
 from app.services.auth_v2 import (
     AuthV2Error,
     InviteRejected,
@@ -281,6 +281,9 @@ def admin_create_invite(
             intended_email=str(payload.intended_email) if payload.intended_email else None,
             ttl_seconds=settings.auth_invite_ttl_seconds,
             plan_id=payload.plan_id,
+            created_by_kind="admin",
+            created_by_user_id=None,
+            created_by_label="Admin",
             request_id=req,
         )
         db.commit()
@@ -807,6 +810,9 @@ class AdminInviteSummary(BaseModel):
     expires_at: datetime | None
     revoked_at: datetime | None
     created_at: datetime
+    created_by_kind: str
+    created_by_user_id: UUID | None
+    created_by_label: str
     state: str
 
 
@@ -816,6 +822,12 @@ class AdminUserSummary(BaseModel):
     email_verified_at: datetime
     created_at: datetime
     deletion_requested_at: datetime | None
+    registration_invite_id: UUID | None
+    invite_issued_at: datetime | None
+    invite_redeemed_at: datetime | None
+    invited_by_kind: str | None
+    invited_by_user_id: UUID | None
+    invited_by_label: str | None
     grants: list[GrantSummary]
     profiles: list[ProfileSummary]
 
@@ -866,6 +878,9 @@ def _admin_invite_summary(invite: Invite, *, now: datetime | None = None) -> Adm
         expires_at=invite.expires_at,
         revoked_at=invite.revoked_at,
         created_at=invite.created_at,
+        created_by_kind=invite.created_by_kind,
+        created_by_user_id=invite.created_by_user_id,
+        created_by_label=invite.created_by_label,
         state=_admin_invite_state(invite, now=now),
     )
 
@@ -1005,13 +1020,15 @@ def admin_revoke_invite(
 def admin_list_users(
     email: str | None = None,
     limit: int = 100,
+    offset: int = 0,
     db: Session = Depends(get_db),
 ):
     bounded_limit = min(max(int(limit), 1), 200)
-    stmt = select(User).order_by(User.created_at.desc())
+    bounded_offset = max(int(offset), 0)
+    stmt = select(User).order_by(User.created_at.desc(), User.id.desc())
     if email is not None and str(email).strip():
         stmt = stmt.where(User.email == str(email).strip().casefold())
-    users = db.execute(stmt.limit(bounded_limit)).scalars().all()
+    users = db.execute(stmt.offset(bounded_offset).limit(bounded_limit)).scalars().all()
     result: list[AdminUserSummary] = []
     for user in users:
         profiles = db.execute(
@@ -1019,6 +1036,15 @@ def admin_list_users(
             .where(ConnectionProfile.user_id == user.id)
             .order_by(ConnectionProfile.created_at.asc())
         ).scalars().all()
+        registration = db.execute(
+            select(InviteRedemption, Invite)
+            .join(Invite, Invite.id == InviteRedemption.invite_id)
+            .where(InviteRedemption.user_id == user.id)
+            .order_by(InviteRedemption.redeemed_at.asc(), InviteRedemption.id.asc())
+            .limit(1)
+        ).first()
+        redemption = registration[0] if registration else None
+        invite = registration[1] if registration else None
         result.append(
             AdminUserSummary(
                 user_id=user.id,
@@ -1026,6 +1052,12 @@ def admin_list_users(
                 email_verified_at=user.email_verified_at,
                 created_at=user.created_at,
                 deletion_requested_at=user.deletion_requested_at,
+                registration_invite_id=invite.id if invite else None,
+                invite_issued_at=invite.created_at if invite else None,
+                invite_redeemed_at=redemption.redeemed_at if redemption else None,
+                invited_by_kind=invite.created_by_kind if invite else None,
+                invited_by_user_id=invite.created_by_user_id if invite else None,
+                invited_by_label=invite.created_by_label if invite else None,
                 grants=_admin_grant_summaries(db, user=user),
                 profiles=[_profile_summary(profile) for profile in profiles],
             )

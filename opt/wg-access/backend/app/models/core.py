@@ -85,11 +85,14 @@ class Invite(Base):
     __table_args__ = (
         CheckConstraint("max_uses >= 1", name="invites_max_uses_positive"),
         CheckConstraint("used_count >= 0 AND used_count <= max_uses", name="invites_used_count_range"),
+        CheckConstraint("created_by_kind IN ('admin','user','system')", name="invites_created_by_kind_check"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     token_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_by_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_by_label: Mapped[str] = mapped_column(String(320), nullable=False)
     intended_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True)
     max_uses: Mapped[int] = mapped_column(Integer, default=1, nullable=False)

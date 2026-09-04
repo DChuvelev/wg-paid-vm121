@@ -108,6 +108,9 @@ def issue_invite(
     intended_email: str | None,
     ttl_seconds: int,
     plan_id: uuid.UUID,
+    created_by_kind: str = "admin",
+    created_by_user_id: uuid.UUID | None = None,
+    created_by_label: str | None = None,
     request_id: str | None = None,
 ) -> InviteIssueResult:
     normalized = normalize_email(intended_email) if intended_email else None
@@ -117,12 +120,32 @@ def issue_invite(
     if plan is None or not plan.active:
         raise AuthV2Error("plan is unavailable")
 
+    issuer_kind = str(created_by_kind or "").strip().casefold()
+    if issuer_kind not in {"admin", "user", "system"}:
+        raise AuthV2Error("invite issuer kind is invalid")
+    issuer_user_id = created_by_user_id
+    if issuer_kind == "user":
+        if issuer_user_id is None:
+            raise AuthV2Error("invite issuer user is required")
+        issuer = db.get(User, issuer_user_id)
+        if issuer is None:
+            raise AuthV2Error("invite issuer user is unavailable")
+        issuer_label = normalize_email(issuer.email)
+    else:
+        if issuer_user_id is not None:
+            raise AuthV2Error("non-user invite issuer cannot have a user id")
+        issuer_label = str(created_by_label or ("Admin" if issuer_kind == "admin" else "System")).strip()
+        if not issuer_label or len(issuer_label) > 320:
+            raise AuthV2Error("invite issuer label is invalid")
+
     tok = secret_token()
     now = utcnow()
     row = Invite(
         id=uuid.uuid4(),
         token_hash=tok.digest,
-        created_by_user_id=None,
+        created_by_user_id=issuer_user_id,
+        created_by_kind=issuer_kind,
+        created_by_label=issuer_label,
         intended_email=normalized,
         plan_id=plan_id,
         max_uses=1,
@@ -136,7 +159,8 @@ def issue_invite(
     record_audit_event(
         db,
         event_type="auth.invite.issued",
-        actor_kind="admin",
+        actor_kind=issuer_kind,
+        actor_user_id=issuer_user_id,
         object_type="invite",
         object_id=str(row.id),
         request_id=request_id_or_new(request_id),
@@ -145,6 +169,7 @@ def issue_invite(
             "email_hash": email_fingerprint(normalized) if normalized else None,
             "plan_id": str(plan_id) if plan_id else None,
             "max_uses": 1,
+            "created_by_kind": issuer_kind,
         },
     )
     return InviteIssueResult(invite=row, token=tok.raw)
