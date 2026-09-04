@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -1021,13 +1021,58 @@ def admin_list_users(
     email: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    sort_by: Literal[
+        "email",
+        "created_at",
+        "invite_issued_at",
+        "invite_redeemed_at",
+        "invited_by_label",
+    ] = "created_at",
+    sort_dir: Literal["asc", "desc"] = "desc",
     db: Session = Depends(get_db),
 ):
     bounded_limit = min(max(int(limit), 1), 200)
     bounded_offset = max(int(offset), 0)
-    stmt = select(User).order_by(User.created_at.desc(), User.id.desc())
+
+    registration_ranked = (
+        select(
+            InviteRedemption.user_id.label("user_id"),
+            InviteRedemption.invite_id.label("invite_id"),
+            InviteRedemption.redeemed_at.label("redeemed_at"),
+            func.row_number().over(
+                partition_by=InviteRedemption.user_id,
+                order_by=(InviteRedemption.redeemed_at.asc(), InviteRedemption.id.asc()),
+            ).label("registration_rank"),
+        )
+        .subquery()
+    )
+    stmt = (
+        select(User)
+        .outerjoin(
+            registration_ranked,
+            and_(
+                registration_ranked.c.user_id == User.id,
+                registration_ranked.c.registration_rank == 1,
+            ),
+        )
+        .outerjoin(Invite, Invite.id == registration_ranked.c.invite_id)
+    )
     if email is not None and str(email).strip():
         stmt = stmt.where(User.email == str(email).strip().casefold())
+
+    sort_columns = {
+        "email": User.email,
+        "created_at": User.created_at,
+        "invite_issued_at": Invite.created_at,
+        "invite_redeemed_at": registration_ranked.c.redeemed_at,
+        "invited_by_label": func.lower(Invite.created_by_label),
+    }
+    sort_column = sort_columns[sort_by]
+    if sort_dir == "asc":
+        stmt = stmt.order_by(sort_column.asc().nulls_last(), User.id.asc())
+    else:
+        stmt = stmt.order_by(sort_column.desc().nulls_last(), User.id.desc())
+
     users = db.execute(stmt.offset(bounded_offset).limit(bounded_limit)).scalars().all()
     result: list[AdminUserSummary] = []
     for user in users:
