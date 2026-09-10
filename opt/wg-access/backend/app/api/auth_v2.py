@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import logging
 import base64
 import hashlib
 import hmac
@@ -78,6 +79,7 @@ ADMIN_CSRF_COOKIE = "wg_admin_csrf"
 ADMIN_CSRF_HEADER = "x-admin-csrf-token"
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 GENERIC_LOGIN_RESPONSE = {"status": "accepted"}
+logger = logging.getLogger(__name__)
 
 
 def _deliver_magic_link_result(db: Session, *, result: MagicLinkIssueResult, request_id: str) -> bool:
@@ -102,9 +104,22 @@ def _deliver_magic_link_result(db: Session, *, result: MagicLinkIssueResult, req
             },
         )
         return True
-    except MailDeliveryError:
-        # Delivery failure invalidates the issued token but keeps the invite
-        # available for an explicit retry/correction.
+    except MailDeliveryError as exc:
+        # Never log recipient, token, SMTP response text, or credentials.
+        cause = exc.__cause__
+        cause_type = type(cause).__name__ if cause is not None else type(exc).__name__
+        smtp_code = getattr(cause, "smtp_code", None)
+        os_errno = getattr(cause, "errno", None)
+        if not isinstance(smtp_code, int):
+            smtp_code = None
+        if not isinstance(os_errno, int):
+            os_errno = None
+        logger.error(
+            "magic-link delivery failed request_id=%s cause_type=%s smtp_code=%s errno=%s",
+            request_id, cause_type, smtp_code, os_errno,
+        )
+        # The newly issued token is unusable after a failed delivery.
+        # For resend flows, the prior live token is deliberately preserved.
         result.row.consumed_at = utcnow()
         record_audit_event(
             db,
@@ -116,6 +131,9 @@ def _deliver_magic_link_result(db: Session, *, result: MagicLinkIssueResult, req
             payload={
                 "email_hash": email_fingerprint(result.row.email),
                 "purpose": result.row.purpose,
+                "cause_type": cause_type,
+                "smtp_code": smtp_code,
+                "errno": os_errno,
             },
         )
         return False
@@ -536,7 +554,18 @@ def resend_invite_route(
             cooldown_seconds=settings.auth_registration_resend_cooldown_seconds,
             request_id=req,
         )
-        _deliver_magic_link_result(db, result=result, request_id=req)
+        delivered = _deliver_magic_link_result(db, result=result, request_id=req)
+        if delivered and result.row is not None:
+            invite = db.get(Invite, result.row.invite_id) if result.row.invite_id is not None else None
+            if invite is not None:
+                invalidate_registration_tokens(
+                    db,
+                    invite=invite,
+                    now=utcnow(),
+                    request_id=req,
+                    reason="explicit_resend",
+                    keep_token_id=result.row.id if result.row.purpose == "registration" else None,
+                )
         db.commit()
     except InviteResendTooSoon as exc:
         db.rollback()
@@ -1369,10 +1398,25 @@ def admin_resend_invite(
             cooldown_seconds=settings.auth_registration_resend_cooldown_seconds,
             request_id=req,
         )
-        _deliver_magic_link_result(db, result=result, request_id=req)
-        db.commit()
+        delivered = _deliver_magic_link_result(db, result=result, request_id=req)
         invite = db.get(Invite, invite_id)
         assert invite is not None
+        if delivered and result.row is not None:
+            invalidate_registration_tokens(
+                db,
+                invite=invite,
+                now=utcnow(),
+                request_id=req,
+                reason=(
+                    "admin_explicit_resend"
+                    if result.row.purpose == "registration"
+                    else "admin_resend_recipient_became_existing_user"
+                ),
+                keep_token_id=result.row.id if result.row.purpose == "registration" else None,
+            )
+        db.commit()
+        if not delivered:
+            raise HTTPException(status_code=502, detail="email delivery failed")
     except InviteResendTooSoon as exc:
         db.rollback()
         raise HTTPException(

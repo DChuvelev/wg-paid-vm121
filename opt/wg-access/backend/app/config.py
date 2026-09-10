@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     smtp_username: str = ""
     smtp_password_file: str = ""
     smtp_from_email: str = ""
-    smtp_from_name: str = "WG Paid"
+    smtp_from_name: str = "Secret Studio"
     smtp_timeout_seconds: int = 10
 
     wg_default_node_id: str = "ddn-test"

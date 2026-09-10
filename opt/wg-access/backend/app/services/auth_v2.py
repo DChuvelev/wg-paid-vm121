@@ -277,14 +277,18 @@ def invalidate_registration_tokens(
     now: datetime,
     request_id: str,
     reason: str,
+    keep_token_id: uuid.UUID | None = None,
 ) -> int:
+    filters = [
+        MagicLinkToken.invite_id == invite.id,
+        MagicLinkToken.purpose == "registration",
+        MagicLinkToken.consumed_at.is_(None),
+    ]
+    if keep_token_id is not None:
+        filters.append(MagicLinkToken.id != keep_token_id)
     rows = db.execute(
         select(MagicLinkToken)
-        .where(
-            MagicLinkToken.invite_id == invite.id,
-            MagicLinkToken.purpose == "registration",
-            MagicLinkToken.consumed_at.is_(None),
-        )
+        .where(*filters)
         .with_for_update()
     ).scalars().all()
     for row in rows:
@@ -506,22 +510,8 @@ def resend_invite_registration(
         request_id=req,
     )
     if existing_login is not None:
-        invalidate_registration_tokens(
-            db,
-            invite=invite,
-            now=now,
-            request_id=req,
-            reason="recipient_became_existing_user",
-        )
         return existing_login
 
-    invalidate_registration_tokens(
-        db,
-        invite=invite,
-        now=now,
-        request_id=req,
-        reason="explicit_resend",
-    )
     return _issue_registration_token(
         db,
         invite=invite,
@@ -715,22 +705,8 @@ def admin_resend_invite_registration(
         request_id=req,
     )
     if existing_login is not None:
-        invalidate_registration_tokens(
-            db,
-            invite=invite,
-            now=now,
-            request_id=req,
-            reason="admin_resend_recipient_became_existing_user",
-        )
         return existing_login
 
-    invalidate_registration_tokens(
-        db,
-        invite=invite,
-        now=now,
-        request_id=req,
-        reason="admin_explicit_resend",
-    )
     return _issue_registration_token(
         db,
         invite=invite,

@@ -57,7 +57,7 @@ def _delivery_settings() -> tuple[str, int, str, str, str, str, int]:
     security = str(settings.smtp_security or "").strip().lower()
     username = str(settings.smtp_username or "").strip()
     from_email = str(settings.smtp_from_email or "").strip()
-    from_name = str(settings.smtp_from_name or "").strip() or "WG Paid"
+    from_name = str(settings.smtp_from_name or "").strip() or "Secret Studio"
     timeout = int(settings.smtp_timeout_seconds)
     if not host or not from_email or port < 1 or port > 65535 or timeout < 1 or timeout > 120:
         raise MailDeliveryError("SMTP delivery settings are incomplete")
