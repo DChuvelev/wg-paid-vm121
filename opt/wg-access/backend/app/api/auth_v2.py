@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import base64
 import hashlib
 import hmac
@@ -19,21 +19,30 @@ from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_m
 from app.agent_trigger import trigger_wg_access_agent_best_effort
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
-from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, InviteRedemption, Plan, User
+from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, InviteRedemption, MagicLinkToken, Plan, User
 from app.services.auth_v2 import (
     AuthV2Error,
     InviteRejected,
+    InviteResendTooSoon,
+    MagicLinkIssueResult,
     MagicLinkRejected,
     RateLimitExceeded,
     SessionRejected,
+    admin_replace_invite_email,
+    admin_resend_invite_registration,
     authenticate_session,
+    change_invite_registration_email,
     consume_magic_link,
     email_fingerprint,
     enforce_rate_limit,
     issue_invite,
+    inspect_invite,
+    invalidate_registration_tokens,
     issue_magic_link_for_email,
+    latest_registration_token,
     request_invite_registration,
     request_id_or_new,
+    resend_invite_registration,
     revoke_session,
 )
 from app.services.domain_v2 import (
@@ -69,6 +78,70 @@ ADMIN_CSRF_COOKIE = "wg_admin_csrf"
 ADMIN_CSRF_HEADER = "x-admin-csrf-token"
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 GENERIC_LOGIN_RESPONSE = {"status": "accepted"}
+
+
+def _deliver_magic_link_result(db: Session, *, result: MagicLinkIssueResult, request_id: str) -> bool:
+    if result.row is None or result.token is None:
+        return False
+    try:
+        deliver_magic_link_email(
+            to_email=result.row.email,
+            token=result.token,
+            issued_at=result.row.created_at,
+        )
+        record_audit_event(
+            db,
+            event_type="auth.magic_link.delivered",
+            actor_kind="system",
+            object_type="magic_link_token",
+            object_id=str(result.row.id),
+            request_id=request_id,
+            payload={
+                "email_hash": email_fingerprint(result.row.email),
+                "purpose": result.row.purpose,
+            },
+        )
+        return True
+    except MailDeliveryError:
+        # Delivery failure invalidates the issued token but keeps the invite
+        # available for an explicit retry/correction.
+        result.row.consumed_at = utcnow()
+        record_audit_event(
+            db,
+            event_type="auth.magic_link.delivery_failed",
+            actor_kind="system",
+            object_type="magic_link_token",
+            object_id=str(result.row.id),
+            request_id=request_id,
+            payload={
+                "email_hash": email_fingerprint(result.row.email),
+                "purpose": result.row.purpose,
+            },
+        )
+        return False
+
+
+def _mask_email(value: str | None) -> str | None:
+    text_value = str(value or "").strip()
+    if not text_value or "@" not in text_value:
+        return None
+    local, domain = text_value.rsplit("@", 1)
+    if not local or not domain:
+        return None
+    return f"{local[:1]}***@{domain}"
+
+
+def _invite_lifecycle_state(invite: Invite, *, now: datetime | None = None) -> str:
+    point = now or utcnow()
+    if invite.revoked_at is not None:
+        return "revoked"
+    if invite.expires_at is not None and invite.expires_at <= point:
+        return "expired"
+    if invite.used_count >= invite.max_uses:
+        return "used"
+    if invite.pending_email:
+        return "awaiting_confirmation"
+    return "active"
 
 
 def _request_id(request: Request) -> str:
@@ -256,12 +329,16 @@ def admin_session_logout(response: Response):
 class AdminInviteRequest(BaseModel):
     intended_email: EmailStr | None = None
     plan_id: UUID
+    wireguard_profile_limit: int | None = Field(default=None, ge=0)
 
 
 class AdminInviteResponse(BaseModel):
     invite_id: UUID
     invite_token: str
     expires_at: datetime | None
+    intended_email: str | None
+    wireguard_profile_limit: int
+    email_sent: bool
 
 
 @router.post(
@@ -276,17 +353,28 @@ def admin_create_invite(
     db: Session = Depends(get_db),
 ):
     req = _request_id(request)
+    email_sent = False
     try:
         result = issue_invite(
             db,
             intended_email=str(payload.intended_email) if payload.intended_email else None,
             ttl_seconds=settings.auth_invite_ttl_seconds,
             plan_id=payload.plan_id,
+            wireguard_profile_limit=payload.wireguard_profile_limit,
             created_by_kind="admin",
             created_by_user_id=None,
             created_by_label="Admin",
             request_id=req,
         )
+        if payload.intended_email:
+            mail_result = request_invite_registration(
+                db,
+                token=result.token,
+                email=str(payload.intended_email),
+                ttl_seconds=settings.auth_magic_link_ttl_seconds,
+                request_id=req,
+            )
+            email_sent = _deliver_magic_link_result(db, result=mail_result, request_id=req)
         db.commit()
         db.refresh(result.invite)
     except (AuthV2Error, InvalidIdentity) as exc:
@@ -296,6 +384,9 @@ def admin_create_invite(
         invite_id=result.invite.id,
         invite_token=result.token,
         expires_at=result.invite.expires_at,
+        intended_email=result.invite.intended_email,
+        wireguard_profile_limit=result.invite.wireguard_profile_limit,
+        email_sent=email_sent,
     )
 
 
@@ -334,38 +425,7 @@ def redeem_invite_route(
             ttl_seconds=settings.auth_magic_link_ttl_seconds,
             request_id=req,
         )
-        if result.row is not None and result.token is not None:
-            try:
-                deliver_magic_link_email(
-                    to_email=result.row.email,
-                    token=result.token,
-                )
-                record_audit_event(
-                    db,
-                    event_type="auth.magic_link.delivered",
-                    actor_kind="system",
-                    object_type="magic_link_token",
-                    object_id=str(result.row.id),
-                    request_id=req,
-                    payload={
-                        "email_hash": email_fingerprint(result.row.email),
-                        "purpose": result.row.purpose,
-                    },
-                )
-            except MailDeliveryError:
-                result.row.consumed_at = utcnow()
-                record_audit_event(
-                    db,
-                    event_type="auth.magic_link.delivery_failed",
-                    actor_kind="system",
-                    object_type="magic_link_token",
-                    object_id=str(result.row.id),
-                    request_id=req,
-                    payload={
-                        "email_hash": email_fingerprint(result.row.email),
-                        "purpose": result.row.purpose,
-                    },
-                )
+        _deliver_magic_link_result(db, result=result, request_id=req)
         db.commit()
     except (InviteRejected, InvalidIdentity) as exc:
         db.rollback()
@@ -377,6 +437,159 @@ def redeem_invite_route(
             payload={"email_hash": email_fingerprint(str(payload.email))},
         )
         db.commit()
+        raise HTTPException(status_code=400, detail="invalid invite") from exc
+    return GENERIC_LOGIN_RESPONSE
+
+
+class InviteInspectRequest(BaseModel):
+    invite_token: str
+
+
+class InviteInspectResponse(BaseModel):
+    state: Literal["active", "awaiting_confirmation", "used", "revoked", "expired"]
+    email_bound: bool
+    pending_email_masked: str | None
+    magic_link_sent_at: datetime | None
+    magic_link_expires_at: datetime | None
+    resend_available_at: datetime | None
+    can_resend: bool
+    can_change_email: bool
+
+
+def _public_invite_inspect(db: Session, *, invite: Invite, now: datetime) -> InviteInspectResponse:
+    state = _invite_lifecycle_state(invite, now=now)
+    latest = latest_registration_token(db, invite_id=invite.id)
+    live = (
+        latest
+        if latest is not None and latest.consumed_at is None and latest.expires_at > now
+        else None
+    )
+    effective_pending_email = invite.pending_email or (live.email if live is not None else None)
+    if state == "active" and effective_pending_email is not None:
+        state = "awaiting_confirmation"
+    resend_available_at = None
+    if effective_pending_email and latest is not None:
+        resend_available_at = latest.created_at + timedelta(
+            seconds=settings.auth_registration_resend_cooldown_seconds
+        )
+    can_resend = (
+        state == "awaiting_confirmation"
+        and effective_pending_email is not None
+        and (resend_available_at is None or resend_available_at <= now)
+    )
+    return InviteInspectResponse(
+        state=state,
+        email_bound=invite.intended_email is not None,
+        pending_email_masked=_mask_email(effective_pending_email),
+        magic_link_sent_at=latest.created_at if latest is not None else None,
+        magic_link_expires_at=live.expires_at if live is not None else None,
+        resend_available_at=resend_available_at,
+        can_resend=can_resend,
+        can_change_email=(state == "awaiting_confirmation" and invite.intended_email is None),
+    )
+
+
+@router.post("/auth/invites/inspect", response_model=InviteInspectResponse)
+def inspect_invite_route(
+    payload: InviteInspectRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    try:
+        invite = inspect_invite(db, token=payload.invite_token)
+    except InviteRejected as exc:
+        raise HTTPException(status_code=404, detail="invite not found") from exc
+    return _public_invite_inspect(db, invite=invite, now=utcnow())
+
+
+class InviteResendRequest(BaseModel):
+    invite_token: str
+
+
+@router.post("/auth/invites/resend", status_code=status.HTTP_202_ACCEPTED)
+def resend_invite_route(
+    payload: InviteResendRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    req = _request_id(request)
+    try:
+        enforce_rate_limit(
+            db,
+            scope="invite_resend",
+            subject=f"{_client_key(request)}|{payload.invite_token[:16]}",
+            limit=settings.auth_redeem_rate_limit,
+            window_seconds=settings.auth_rate_window_seconds,
+            request_id=req,
+        )
+        db.commit()
+    except RateLimitExceeded as exc:
+        db.commit()
+        raise HTTPException(status_code=429, detail="too many requests") from exc
+
+    try:
+        result = resend_invite_registration(
+            db,
+            token=payload.invite_token,
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
+            cooldown_seconds=settings.auth_registration_resend_cooldown_seconds,
+            request_id=req,
+        )
+        _deliver_magic_link_result(db, result=result, request_id=req)
+        db.commit()
+    except InviteResendTooSoon as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=429,
+            detail="resend cooldown",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+    except (InviteRejected, InvalidIdentity) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="invalid invite") from exc
+    return GENERIC_LOGIN_RESPONSE
+
+
+class InviteChangeEmailRequest(BaseModel):
+    invite_token: str
+    email: EmailStr
+
+
+@router.post("/auth/invites/change-email", status_code=status.HTTP_202_ACCEPTED)
+def change_invite_email_route(
+    payload: InviteChangeEmailRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    req = _request_id(request)
+    try:
+        enforce_rate_limit(
+            db,
+            scope="invite_change_email",
+            subject=f"{_client_key(request)}|{payload.invite_token[:16]}",
+            limit=settings.auth_redeem_rate_limit,
+            window_seconds=settings.auth_rate_window_seconds,
+            request_id=req,
+        )
+        db.commit()
+    except RateLimitExceeded as exc:
+        db.commit()
+        raise HTTPException(status_code=429, detail="too many requests") from exc
+
+    try:
+        result = change_invite_registration_email(
+            db,
+            token=payload.invite_token,
+            email=str(payload.email),
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
+            request_id=req,
+        )
+        _deliver_magic_link_result(db, result=result, request_id=req)
+        db.commit()
+    except (InviteRejected, InvalidIdentity) as exc:
+        db.rollback()
         raise HTTPException(status_code=400, detail="invalid invite") from exc
     return GENERIC_LOGIN_RESPONSE
 
@@ -415,34 +628,7 @@ def login_request(
             ttl_seconds=settings.auth_magic_link_ttl_seconds,
             request_id=req,
         )
-        if result.row is not None and result.token is not None:
-            try:
-                deliver_magic_link_email(
-                    to_email=result.row.email,
-                    token=result.token,
-                )
-                record_audit_event(
-                    db,
-                    event_type="auth.magic_link.delivered",
-                    actor_kind="system",
-                    object_type="magic_link_token",
-                    object_id=str(result.row.id),
-                    request_id=req,
-                    payload={"email_hash": email_fingerprint(result.row.email)},
-                )
-            except MailDeliveryError:
-                # An undelivered token must not remain usable. The public response
-                # stays generic so delivery state cannot become an enumeration oracle.
-                result.row.consumed_at = utcnow()
-                record_audit_event(
-                    db,
-                    event_type="auth.magic_link.delivery_failed",
-                    actor_kind="system",
-                    object_type="magic_link_token",
-                    object_id=str(result.row.id),
-                    request_id=req,
-                    payload={"email_hash": email_fingerprint(result.row.email)},
-                )
+        _deliver_magic_link_result(db, result=result, request_id=req)
         db.commit()
     except InvalidIdentity:
         db.rollback()
@@ -873,7 +1059,9 @@ class AdminPlanSummary(BaseModel):
 class AdminInviteSummary(BaseModel):
     invite_id: UUID
     intended_email: str | None
+    pending_email: str | None
     plan_id: UUID | None
+    wireguard_profile_limit: int
     max_uses: int
     used_count: int
     expires_at: datetime | None
@@ -882,7 +1070,13 @@ class AdminInviteSummary(BaseModel):
     created_by_kind: str
     created_by_user_id: UUID | None
     created_by_label: str
-    state: str
+    state: Literal["active", "awaiting_confirmation", "used", "revoked", "expired"]
+    magic_link_sent_at: datetime | None
+    magic_link_expires_at: datetime | None
+    resend_available_at: datetime | None
+    can_resend: bool
+    can_change_email: bool
+    can_revoke: bool
 
 
 class AdminUserSummary(BaseModel):
@@ -938,22 +1132,35 @@ class AdminProtocolLimitUpdateResponse(BaseModel):
     retirement_in_progress: bool
 
 
-def _admin_invite_state(invite: Invite, *, now: datetime | None = None) -> str:
+def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None = None) -> AdminInviteSummary:
     point = now or utcnow()
-    if invite.revoked_at is not None:
-        return "revoked"
-    if invite.expires_at is not None and invite.expires_at <= point:
-        return "expired"
-    if invite.used_count >= invite.max_uses:
-        return "used"
-    return "active"
-
-
-def _admin_invite_summary(invite: Invite, *, now: datetime | None = None) -> AdminInviteSummary:
+    state = _invite_lifecycle_state(invite, now=point)
+    latest = latest_registration_token(db, invite_id=invite.id)
+    live = (
+        latest
+        if latest is not None and latest.consumed_at is None and latest.expires_at > point
+        else None
+    )
+    effective_pending_email = invite.pending_email or (live.email if live is not None else None)
+    if state == "active" and effective_pending_email is not None:
+        state = "awaiting_confirmation"
+    resend_available_at = None
+    if effective_pending_email and latest is not None:
+        resend_available_at = latest.created_at + timedelta(
+            seconds=settings.auth_registration_resend_cooldown_seconds
+        )
+    plan = db.get(Plan, invite.plan_id) if invite.plan_id is not None else None
+    effective_limit = (
+        int(invite.wireguard_profile_limit)
+        if invite.wireguard_profile_limit is not None
+        else int(plan.default_wireguard_limit) if plan is not None else 0
+    )
     return AdminInviteSummary(
         invite_id=invite.id,
         intended_email=invite.intended_email,
+        pending_email=effective_pending_email,
         plan_id=invite.plan_id,
+        wireguard_profile_limit=effective_limit,
         max_uses=invite.max_uses,
         used_count=invite.used_count,
         expires_at=invite.expires_at,
@@ -962,7 +1169,17 @@ def _admin_invite_summary(invite: Invite, *, now: datetime | None = None) -> Adm
         created_by_kind=invite.created_by_kind,
         created_by_user_id=invite.created_by_user_id,
         created_by_label=invite.created_by_label,
-        state=_admin_invite_state(invite, now=now),
+        state=state,
+        magic_link_sent_at=latest.created_at if latest is not None else None,
+        magic_link_expires_at=live.expires_at if live is not None else None,
+        resend_available_at=resend_available_at,
+        can_resend=(
+            state == "awaiting_confirmation"
+            and effective_pending_email is not None
+            and (resend_available_at is None or resend_available_at <= point)
+        ),
+        can_change_email=(state in {"active", "awaiting_confirmation"}),
+        can_revoke=(state in {"active", "awaiting_confirmation"}),
     )
 
 
@@ -1058,7 +1275,115 @@ def admin_list_plans(db: Session = Depends(get_db)):
 def admin_list_invites(db: Session = Depends(get_db)):
     rows = db.execute(select(Invite).order_by(Invite.created_at.desc())).scalars().all()
     point = utcnow()
-    return [_admin_invite_summary(row, now=point) for row in rows]
+    return [_admin_invite_summary(db, row, now=point) for row in rows]
+
+
+class AdminInviteRecipientUpdateRequest(BaseModel):
+    email: EmailStr | None = None
+
+
+class AdminInviteLimitUpdateRequest(BaseModel):
+    profile_limit: int = Field(ge=0)
+
+
+@router.patch(
+    "/admin/invites/{invite_id}/recipient",
+    response_model=AdminInviteSummary,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_update_invite_recipient(
+    invite_id: UUID,
+    payload: AdminInviteRecipientUpdateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    req = _request_id(request)
+    try:
+        invite, mail_result = admin_replace_invite_email(
+            db,
+            invite_id=invite_id,
+            email=str(payload.email) if payload.email is not None else None,
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
+            request_id=req,
+        )
+        _deliver_magic_link_result(db, result=mail_result, request_id=req)
+        db.commit()
+        db.refresh(invite)
+    except (InviteRejected, InvalidIdentity) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="invite cannot be updated") from exc
+    return _admin_invite_summary(db, invite, now=utcnow())
+
+
+@router.patch(
+    "/admin/invites/{invite_id}/wireguard-limit",
+    response_model=AdminInviteSummary,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_update_invite_wireguard_limit(
+    invite_id: UUID,
+    payload: AdminInviteLimitUpdateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    invite = db.execute(
+        select(Invite).where(Invite.id == invite_id).with_for_update()
+    ).scalar_one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=404, detail="invite not found")
+    now = utcnow()
+    if _invite_lifecycle_state(invite, now=now) not in {"active", "awaiting_confirmation"}:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="invite cannot be updated")
+    invite.wireguard_profile_limit = int(payload.profile_limit)
+    record_audit_event(
+        db,
+        event_type="auth.invite.wireguard_limit_changed",
+        actor_kind="admin",
+        object_type="invite",
+        object_id=str(invite.id),
+        request_id=_request_id(request),
+        payload={"wireguard_profile_limit": int(payload.profile_limit)},
+    )
+    db.commit()
+    db.refresh(invite)
+    return _admin_invite_summary(db, invite, now=now)
+
+
+@router.post(
+    "/admin/invites/{invite_id}/resend",
+    response_model=AdminInviteSummary,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_resend_invite(
+    invite_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    req = _request_id(request)
+    try:
+        result = admin_resend_invite_registration(
+            db,
+            invite_id=invite_id,
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
+            cooldown_seconds=settings.auth_registration_resend_cooldown_seconds,
+            request_id=req,
+        )
+        _deliver_magic_link_result(db, result=result, request_id=req)
+        db.commit()
+        invite = db.get(Invite, invite_id)
+        assert invite is not None
+    except InviteResendTooSoon as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=429,
+            detail="resend cooldown",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+    except (InviteRejected, InvalidIdentity) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="invite cannot be resent") from exc
+    return _admin_invite_summary(db, invite, now=utcnow())
 
 
 @router.post(
@@ -1077,7 +1402,22 @@ def admin_revoke_invite(
     if invite is None:
         raise HTTPException(status_code=404, detail="invite not found")
     now = utcnow()
+    state = _invite_lifecycle_state(invite, now=now)
+    if state == "used":
+        db.rollback()
+        raise HTTPException(status_code=409, detail="used invite cannot be revoked")
+    if state == "expired":
+        db.rollback()
+        raise HTTPException(status_code=409, detail="expired invite cannot be revoked")
     if invite.revoked_at is None:
+        req = _request_id(request)
+        invalidate_registration_tokens(
+            db,
+            invite=invite,
+            now=now,
+            request_id=req,
+            reason="admin_revoke",
+        )
         invite.revoked_at = now
         record_audit_event(
             db,
@@ -1085,12 +1425,12 @@ def admin_revoke_invite(
             actor_kind="admin",
             object_type="invite",
             object_id=str(invite.id),
-            request_id=_request_id(request),
+            request_id=req,
             payload={"used_count": invite.used_count, "max_uses": invite.max_uses},
         )
     db.commit()
     db.refresh(invite)
-    return _admin_invite_summary(invite, now=now)
+    return _admin_invite_summary(db, invite, now=now)
 
 
 @router.get(

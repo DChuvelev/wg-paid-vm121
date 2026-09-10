@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 import smtplib
@@ -84,20 +85,27 @@ def smtp_delivery_status() -> dict[str, object]:
     }
 
 
-def deliver_magic_link_email(*, to_email: str, token: str) -> None:
+def deliver_magic_link_email(*, to_email: str, token: str, issued_at: datetime | None = None) -> None:
     host, port, security, username, from_email, from_name, timeout = _delivery_settings()
     recipient = str(to_email or "").strip()
     if not recipient:
         raise MailDeliveryError("recipient is unavailable")
     url = _magic_link_url(token)
 
+    stamp = issued_at or datetime.now(timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    stamp = stamp.astimezone(timezone.utc)
+
     msg = EmailMessage()
-    msg["Subject"] = "Your WG Paid sign-in link"
+    msg["Subject"] = f"Secret Studio sign-in link — {stamp:%Y-%m-%d %H:%M UTC}"
     msg["From"] = f"{from_name} <{from_email}>"
     msg["To"] = recipient
     msg.set_content(
-        "Use this one-time link to sign in to WG Paid. "
-        "The link expires automatically and can only be used once.\n\n"
+        "Use this one-time link to sign in to Secret Studio. "
+        "The link expires automatically and can only be used once. "
+        "If you requested another link later, use the newest message.\n\n"
+        f"Issued: {stamp:%Y-%m-%d %H:%M:%S UTC}\n"
         f"{url}\n"
     )
 

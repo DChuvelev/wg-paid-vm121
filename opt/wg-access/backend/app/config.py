@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     auth_invite_ttl_seconds: int = 7 * 24 * 60 * 60
     auth_magic_link_ttl_seconds: int = 15 * 60
+    auth_registration_resend_cooldown_seconds: int = 60
     auth_session_ttl_seconds: int = 7 * 24 * 60 * 60
     auth_rate_window_seconds: int = 10 * 60
     auth_login_rate_limit: int = 5

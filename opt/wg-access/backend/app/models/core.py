@@ -87,6 +87,7 @@ class Invite(Base):
     __table_args__ = (
         CheckConstraint("max_uses >= 1", name="invites_max_uses_positive"),
         CheckConstraint("used_count >= 0 AND used_count <= max_uses", name="invites_used_count_range"),
+        CheckConstraint("wireguard_profile_limit >= 0", name="invites_wireguard_profile_limit_nonnegative"),
         CheckConstraint("created_by_kind IN ('admin','user','system')", name="invites_created_by_kind_check"),
     )
 
@@ -96,6 +97,8 @@ class Invite(Base):
     created_by_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     created_by_label: Mapped[str] = mapped_column(String(320), nullable=False)
     intended_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    pending_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    wireguard_profile_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True)
     max_uses: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     used_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
