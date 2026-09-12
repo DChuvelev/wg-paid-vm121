@@ -79,6 +79,7 @@ ADMIN_CSRF_COOKIE = "wg_admin_csrf"
 ADMIN_CSRF_HEADER = "x-admin-csrf-token"
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 GENERIC_LOGIN_RESPONSE = {"status": "accepted"}
+PROFILE_CONFIG_DOWNLOAD_VERSION = "v1"
 logger = logging.getLogger(__name__)
 
 
@@ -190,6 +191,76 @@ def _issue_admin_session_token() -> str:
     nonce = secrets.token_urlsafe(24)
     body = f"v1.{expires_at}.{nonce}"
     return f"{body}.{_admin_session_signature(body)}"
+
+
+def _profile_config_download_signature(
+    session: AuthSession,
+    *,
+    profile_id: UUID,
+    body: str,
+) -> str:
+    digest = hmac.new(
+        session.token_hash.encode("ascii"),
+        f"{body}.{profile_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _issue_profile_config_download_token(session: AuthSession, *, profile_id: UUID) -> str:
+    now = int(time.time())
+    expires_at = min(
+        now + max(1, int(settings.auth_profile_config_download_ttl_seconds)),
+        int(session.expires_at.timestamp()),
+    )
+    if expires_at <= now:
+        raise SessionRejected("session expired")
+    body = f"{PROFILE_CONFIG_DOWNLOAD_VERSION}.{session.id.hex}.{expires_at}"
+    signature = _profile_config_download_signature(
+        session,
+        profile_id=profile_id,
+        body=body,
+    )
+    return f"{body}.{signature}"
+
+
+def _profile_config_download_user(
+    db: Session,
+    *,
+    profile_id: UUID,
+    token: str,
+) -> User:
+    try:
+        version, session_hex, expires_text, signature = token.split(".", 3)
+        session_id = UUID(hex=session_hex)
+        expires_at = int(expires_text)
+    except (TypeError, ValueError):
+        raise SessionRejected("invalid config download token")
+
+    now_epoch = int(time.time())
+    if version != PROFILE_CONFIG_DOWNLOAD_VERSION or expires_at <= now_epoch or not signature:
+        raise SessionRejected("invalid config download token")
+
+    session = db.get(AuthSession, session_id)
+    now = utcnow()
+    if session is None or session.revoked_at is not None or session.expires_at <= now:
+        raise SessionRejected("invalid config download token")
+    if expires_at > int(session.expires_at.timestamp()):
+        raise SessionRejected("invalid config download token")
+
+    body = f"{version}.{session.id.hex}.{expires_at}"
+    expected = _profile_config_download_signature(
+        session,
+        profile_id=profile_id,
+        body=body,
+    )
+    if not secrets.compare_digest(signature, expected):
+        raise SessionRejected("invalid config download token")
+
+    user = db.get(User, session.user_id)
+    if user is None or user.deletion_requested_at is not None:
+        raise SessionRejected("invalid config download token")
+    return user
 
 
 def _admin_session_is_valid(token: str | None) -> bool:
@@ -907,6 +978,10 @@ class ProfileLabelUpdateRequest(BaseModel):
     label: str | None = Field(max_length=160)
 
 
+class ProfileConfigDownloadResponse(BaseModel):
+    download_url: str
+
+
 def _profile_summary(profile) -> ProfileSummary:
     return ProfileSummary(
         id=profile.id,
@@ -998,6 +1073,101 @@ def account_profile_update_label(
         db.rollback()
         raise HTTPException(status_code=404, detail="profile unavailable") from exc
     return _profile_summary(profile)
+
+
+@router.post(
+    "/account/profiles/{profile_id}/config-download",
+    response_model=ProfileConfigDownloadResponse,
+)
+def account_profile_config_download_create(
+    profile_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    session, user = current
+    owned = next(
+        (profile for profile in list_owned_profiles(db, user=user) if profile.id == profile_id),
+        None,
+    )
+    if owned is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    if owned.protocol != "wireguard" or owned.status != "active" or not owned.tunnel_ip:
+        raise HTTPException(status_code=409, detail="profile is not ready")
+
+    try:
+        token = _issue_profile_config_download_token(session, profile_id=profile_id)
+    except SessionRejected as exc:
+        raise HTTPException(status_code=401, detail="unauthorized") from exc
+
+    request_id = _request_id(request)
+    record_audit_event(
+        db,
+        event_type="profile.config_download.issued",
+        actor_kind="user",
+        actor_user_id=user.id,
+        object_type="connection_profile",
+        object_id=str(profile_id),
+        request_id=request_id,
+        payload={"ttl_seconds": int(settings.auth_profile_config_download_ttl_seconds)},
+    )
+    db.commit()
+    return ProfileConfigDownloadResponse(
+        download_url=f"/v2/account/profiles/{profile_id}/config-download/{token}"
+    )
+
+
+@router.get("/account/profiles/{profile_id}/config-download/{download_token}")
+def account_profile_config_download(
+    profile_id: UUID,
+    download_token: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    try:
+        user = _profile_config_download_user(
+            db,
+            profile_id=profile_id,
+            token=download_token,
+        )
+    except SessionRejected as exc:
+        raise HTTPException(status_code=404, detail="download unavailable") from exc
+
+    try:
+        config_text = build_owned_wireguard_config(
+            db,
+            user=user,
+            profile_id=profile_id,
+            request_id=_request_id(request),
+        )
+        profile_ordinal = next(
+            (
+                index
+                for index, owned in enumerate(list_owned_profiles(db, user=user), start=1)
+                if owned.id == profile_id
+            ),
+            0,
+        )
+        if profile_ordinal == 0:
+            raise ProfileUnavailable("profile unavailable")
+        db.commit()
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile not found") from exc
+    except ProfileNotReady as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="profile is not ready") from exc
+
+    response = Response(
+        content=config_text,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="SecretStudio-{profile_ordinal:02d}.conf"'},
+    )
+    _private_no_store(response)
+    return response
 
 
 @router.get("/account/profiles/{profile_id}/config")
