@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     database_url: str
     environment: str = "dev"
     agent_token: str = "dev-agent-token"
+    runtime_snapshot_stale_seconds: int = 20
 
     # P26 identity/auth boundary. Public auth remains closed unless explicitly enabled.
     external_onboarding_active: bool = False

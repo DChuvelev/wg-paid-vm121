@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,7 @@ from app.db.session import get_db
 from app.models import ConnectionProfile, Peer, PeerCredential, ProvisioningJob
 from app.services.user_deletion import finalize_user_deletion_if_ready
 from app.services.credential_service import CredentialServiceError, decrypt_profile_credential
+from app.services.runtime_snapshot import replace_runtime_snapshot
 from app.services.domain_v2 import (
     DomainV2Error,
     acknowledge_profile_job,
@@ -227,3 +228,39 @@ def fail_job(
     db.commit()
     db.refresh(job)
     return job
+
+class RuntimeSnapshotRowRequest(BaseModel):
+    profile_id: UUID
+    tunnel_ip: str
+    selector: str = Field(pattern=r"^cs[1-5]$")
+    active_now: bool
+    active_state: bool
+    last_active_at: datetime | None = None
+    last_reassign_at: datetime | None = None
+    last_handshake_at: datetime | None = None
+    rx_bytes: int = Field(ge=0)
+    tx_bytes: int = Field(ge=0)
+    rx_bytes_per_second: float = Field(ge=0)
+    tx_bytes_per_second: float = Field(ge=0)
+
+
+class RuntimeSnapshotRequest(BaseModel):
+    generated_at: datetime
+    sample_interval_seconds: float = Field(gt=0, le=60)
+    rows: list[RuntimeSnapshotRowRequest] = Field(max_length=10000)
+
+
+class RuntimeSnapshotAccepted(BaseModel):
+    status: str
+    received_at: datetime
+    rows: int
+
+
+@router.post("/runtime-snapshot", response_model=RuntimeSnapshotAccepted)
+def ingest_runtime_snapshot(
+    payload: RuntimeSnapshotRequest,
+    _: None = Depends(check_agent_token),
+):
+    received_at = replace_runtime_snapshot(payload.model_dump(mode="python"))
+    return RuntimeSnapshotAccepted(status="accepted", received_at=received_at, rows=len(payload.rows))
+

@@ -133,6 +133,8 @@ def build_owned_wireguard_config(
     profile_id: uuid.UUID,
     request_id: str | None,
     audit_event: str = "profile.config.delivered",
+    audit_actor_kind: str = "user",
+    audit_actor_user_id: uuid.UUID | None = None,
 ) -> str:
     profile = _owned_profile(db, user_id=user.id, profile_id=profile_id)
     if profile.protocol != "wireguard":
@@ -149,8 +151,8 @@ def build_owned_wireguard_config(
     record_audit_event(
         db,
         event_type=audit_event,
-        actor_kind="user",
-        actor_user_id=user.id,
+        actor_kind=audit_actor_kind,
+        actor_user_id=(user.id if audit_actor_kind == "user" and audit_actor_user_id is None else audit_actor_user_id),
         object_type="connection_profile",
         object_id=str(profile.id),
         request_id=request_id,

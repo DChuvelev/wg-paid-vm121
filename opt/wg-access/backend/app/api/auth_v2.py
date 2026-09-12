@@ -57,6 +57,7 @@ from app.services.domain_v2 import (
 )
 
 from app.services.user_deletion import UserDeletionError, request_admin_user_deletion
+from app.services.runtime_snapshot import get_runtime_snapshot
 
 from app.services.profile_delivery import (
     ProfileNotReady,
@@ -1296,6 +1297,35 @@ class AdminUserSummary(BaseModel):
     profiles: list[ProfileSummary]
 
 
+class AdminRuntimeConnectionRow(BaseModel):
+    user_id: UUID
+    email: str
+    display_name: str | None
+    profile_id: UUID
+    profile_label: str | None
+    tunnel_ip: str
+    selector: str
+    active_now: bool
+    active_state: bool
+    last_active_at: datetime | None
+    last_reassign_at: datetime | None
+    last_handshake_at: datetime | None
+    rx_bytes: int
+    tx_bytes: int
+    rx_bytes_per_second: float
+    tx_bytes_per_second: float
+
+
+class AdminRuntimeConnectionsResponse(BaseModel):
+    generated_at: datetime | None
+    received_at: datetime | None
+    snapshot_age_seconds: float | None
+    stale: bool
+    sample_interval_seconds: float | None
+    unmatched_runtime_rows_count: int
+    rows: list[AdminRuntimeConnectionRow]
+
+
 class AdminUserMetadataUpdateRequest(BaseModel):
     admin_note: str | None = Field(max_length=4000)
 
@@ -1645,6 +1675,133 @@ def admin_revoke_invite(
     db.commit()
     db.refresh(invite)
     return _admin_invite_summary(db, invite, now=now)
+
+
+@router.get(
+    "/admin/profiles/{profile_id}/config",
+    dependencies=[Depends(_require_admin)],
+)
+def admin_profile_config_download(
+    profile_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    profile = db.get(ConnectionProfile, profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    user = db.get(User, profile.user_id)
+    if user is None or user.deletion_requested_at is not None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    if profile.protocol != "wireguard" or profile.status != "active" or not profile.tunnel_ip:
+        raise HTTPException(status_code=409, detail="profile is not ready")
+    try:
+        config_text = build_owned_wireguard_config(
+            db,
+            user=user,
+            profile_id=profile_id,
+            request_id=_request_id(request),
+            audit_event="admin.profile.config.delivered",
+            audit_actor_kind="admin",
+        )
+        profile_ordinal = next(
+            (
+                index
+                for index, owned in enumerate(list_owned_profiles(db, user=user), start=1)
+                if owned.id == profile_id
+            ),
+            0,
+        )
+        if profile_ordinal == 0:
+            raise ProfileUnavailable("profile unavailable")
+        db.commit()
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="profile not found") from exc
+    except ProfileNotReady as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="profile is not ready") from exc
+    response = Response(
+        content=config_text,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="SecretStudio-{profile_ordinal:02d}.conf"'},
+    )
+    _private_no_store(response)
+    return response
+
+
+@router.get(
+    "/admin/runtime/connections",
+    response_model=AdminRuntimeConnectionsResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_runtime_connections(db: Session = Depends(get_db)):
+    snapshot, received_at = get_runtime_snapshot()
+    if snapshot is None or received_at is None:
+        return AdminRuntimeConnectionsResponse(
+            generated_at=None,
+            received_at=None,
+            snapshot_age_seconds=None,
+            stale=True,
+            sample_interval_seconds=None,
+            unmatched_runtime_rows_count=0,
+            rows=[],
+        )
+
+    now = utcnow()
+    age_seconds = max(0.0, (now - received_at).total_seconds())
+    runtime_rows = list(snapshot.get("rows") or [])
+    profile_ids = [row.get("profile_id") for row in runtime_rows if row.get("profile_id") is not None]
+    profiles = {
+        profile.id: profile
+        for profile in db.execute(
+            select(ConnectionProfile).where(ConnectionProfile.id.in_(profile_ids))
+        ).scalars().all()
+    } if profile_ids else {}
+    user_ids = {profile.user_id for profile in profiles.values()}
+    users = {
+        user.id: user
+        for user in db.execute(select(User).where(User.id.in_(user_ids))).scalars().all()
+    } if user_ids else {}
+
+    rows: list[AdminRuntimeConnectionRow] = []
+    unmatched = 0
+    for runtime in runtime_rows:
+        profile = profiles.get(runtime.get("profile_id"))
+        if profile is None:
+            unmatched += 1
+            continue
+        user = users.get(profile.user_id)
+        if user is None:
+            unmatched += 1
+            continue
+        rows.append(AdminRuntimeConnectionRow(
+            user_id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            profile_id=profile.id,
+            profile_label=profile.label,
+            tunnel_ip=str(runtime["tunnel_ip"]),
+            selector=str(runtime["selector"]),
+            active_now=bool(runtime["active_now"]),
+            active_state=bool(runtime["active_state"]),
+            last_active_at=runtime.get("last_active_at"),
+            last_reassign_at=runtime.get("last_reassign_at"),
+            last_handshake_at=runtime.get("last_handshake_at"),
+            rx_bytes=int(runtime["rx_bytes"]),
+            tx_bytes=int(runtime["tx_bytes"]),
+            rx_bytes_per_second=float(runtime["rx_bytes_per_second"]),
+            tx_bytes_per_second=float(runtime["tx_bytes_per_second"]),
+        ))
+
+    return AdminRuntimeConnectionsResponse(
+        generated_at=snapshot.get("generated_at"),
+        received_at=received_at,
+        snapshot_age_seconds=age_seconds,
+        stale=age_seconds > max(1, int(settings.runtime_snapshot_stale_seconds)),
+        sample_interval_seconds=float(snapshot.get("sample_interval_seconds")),
+        unmatched_runtime_rows_count=unmatched,
+        rows=rows,
+    )
 
 
 @router.get(
