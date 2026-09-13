@@ -26,6 +26,7 @@ from app.models import (
 SUPPORTED_PROTOCOLS = frozenset({"wireguard", "amneziawg"})
 PROFILE_QUOTA_STATUSES = ("requested", "provisioning", "active", "disabling", "provisioning_failed")
 WIREGUARD_RUNTIME_PROTOCOL = "wireguard"
+AMNEZIAWG_RUNTIME_PROTOCOL = "amneziawg"
 
 
 class DomainV2Error(RuntimeError):
@@ -227,6 +228,41 @@ def reserve_wireguard_tunnel_ip(db: Session, *, profile: ConnectionProfile) -> s
     raise DomainV2Error("wireguard tunnel IP pool exhausted")
 
 
+def reserve_amneziawg_tunnel_ip(db: Session, *, profile: ConnectionProfile) -> str:
+    """Reserve a unique AmneziaWG tunnel IP inside the caller transaction."""
+    if profile.protocol != AMNEZIAWG_RUNTIME_PROTOCOL:
+        raise ProtocolNotAllowed("profile is not amneziawg")
+    if profile.tunnel_ip:
+        return profile.tunnel_ip
+
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": _allocator_lock_key(profile.node_id, profile.protocol)},
+    )
+
+    from app.services.amneziawg import iter_amneziawg_client_ips
+
+    used_profiles = set(
+        db.execute(
+            select(ConnectionProfile.tunnel_ip).where(
+                ConnectionProfile.node_id == profile.node_id,
+                ConnectionProfile.tunnel_ip.is_not(None),
+                ConnectionProfile.id != profile.id,
+            )
+        ).scalars().all()
+    )
+
+    for candidate in iter_amneziawg_client_ips():
+        if candidate in used_profiles:
+            continue
+        profile.tunnel_ip = candidate
+        profile.tunnel_ip_reserved_at = utcnow()
+        profile.tunnel_ip_released_at = None
+        db.flush()
+        return candidate
+    raise DomainV2Error("amneziawg tunnel IP pool exhausted")
+
+
 def current_profile_credential(db: Session, *, profile_id: uuid.UUID) -> PeerCredential:
     row = db.execute(
         select(PeerCredential)
@@ -293,6 +329,70 @@ def prepare_wireguard_profile_provisioning(
     return job, created
 
 
+def prepare_amneziawg_profile_provisioning(
+    db: Session,
+    *,
+    profile: ConnectionProfile,
+) -> tuple[ProvisioningJob, bool]:
+    """Atomically reserve AWG IP, create encrypted credentials and enqueue runtime intent."""
+    if profile.protocol != AMNEZIAWG_RUNTIME_PROTOCOL:
+        raise ProtocolNotAllowed("profile is not amneziawg")
+
+    locked = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.id == profile.id)
+        .with_for_update()
+    ).scalar_one()
+
+    tunnel_ip = reserve_amneziawg_tunnel_ip(db, profile=locked)
+    credential = db.execute(
+        select(PeerCredential)
+        .where(
+            PeerCredential.connection_profile_id == locked.id,
+            PeerCredential.revoked_at.is_(None),
+        )
+        .order_by(PeerCredential.revision.desc())
+        .with_for_update()
+    ).scalars().first()
+    if credential is None:
+        from app.services.credential_service import create_profile_credential_revision
+        credential = create_profile_credential_revision(db, profile_id=locked.id).credential
+
+    locked.status = "provisioning"
+    locked.updated_at = utcnow()
+    desired_generation = hashlib.sha256(
+        f"{locked.id}|{locked.protocol}|{credential.public_key}|{tunnel_ip}|r{credential.revision}".encode("utf-8")
+    ).hexdigest()[:32]
+    operation_id = f"profile-provision:{locked.id}:r{credential.revision}"
+    job, created = enqueue_profile_job(
+        db,
+        profile=locked,
+        action="provision_profile",
+        operation_id=operation_id,
+        desired_generation=desired_generation,
+        payload={
+            "profile_id": str(locked.id),
+            "protocol": locked.protocol,
+            "public_key": credential.public_key,
+            "tunnel_ip": tunnel_ip,
+            "credential_revision": credential.revision,
+        },
+    )
+    return job, created
+
+
+def prepare_profile_provisioning(
+    db: Session,
+    *,
+    profile: ConnectionProfile,
+) -> tuple[ProvisioningJob, bool]:
+    if profile.protocol == WIREGUARD_RUNTIME_PROTOCOL:
+        return prepare_wireguard_profile_provisioning(db, profile=profile)
+    if profile.protocol == AMNEZIAWG_RUNTIME_PROTOCOL:
+        return prepare_amneziawg_profile_provisioning(db, profile=profile)
+    raise ProtocolNotAllowed(profile.protocol)
+
+
 def request_profile_disable(
     db: Session,
     *,
@@ -305,8 +405,8 @@ def request_profile_disable(
     ).scalar_one_or_none()
     if profile is None:
         raise DomainV2Error("connection profile does not exist")
-    if profile.protocol != WIREGUARD_RUNTIME_PROTOCOL:
-        raise ProtocolNotAllowed("wireguard is the first activated runtime protocol")
+    if profile.protocol not in SUPPORTED_PROTOCOLS:
+        raise ProtocolNotAllowed(profile.protocol)
     if profile.status == "disabled":
         existing = db.execute(
             select(ProvisioningJob)
@@ -499,26 +599,7 @@ def create_profile_request(
     db.add(profile)
     db.flush()
 
-    if protocol == WIREGUARD_RUNTIME_PROTOCOL:
-        job, created = prepare_wireguard_profile_provisioning(db, profile=profile)
-    else:
-        # AmneziaWG remains a durable Domain V2 request only. VM100 has no
-        # activated awg_paid user-facing runtime yet, so the job is explicitly
-        # deferred and cannot be consumed by the WireGuard agent.
-        desired_generation = hashlib.sha256(
-            f"{profile.id}|{profile.protocol}|requested|deferred".encode("utf-8")
-        ).hexdigest()[:32]
-        operation_id = f"profile-deferred:{profile.id}:r1"
-        job, created = enqueue_profile_job(
-            db,
-            profile=profile,
-            action="provision_profile_deferred",
-            operation_id=operation_id,
-            desired_generation=desired_generation,
-            payload={"profile_id": str(profile.id), "protocol": protocol, "runtime_deferred": True},
-        )
-        job.status = "deferred"
-        job.next_attempt_at = None
+    job, created = prepare_profile_provisioning(db, profile=profile)
     return ProfileRequestResult(profile=profile, job=job, created_job=created)
 
 

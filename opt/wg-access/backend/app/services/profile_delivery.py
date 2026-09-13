@@ -17,12 +17,13 @@ from app.services.domain_v2 import (
     create_profile_request,
     current_profile_credential,
     grant_is_active,
-    prepare_wireguard_profile_provisioning,
+    prepare_profile_provisioning,
     record_audit_event,
     request_profile_disable,
     utcnow,
 )
-from app.services.wireguard import build_client_config
+from app.services.wireguard import build_client_config as build_wireguard_client_config
+from app.services.amneziawg import build_client_config as build_amneziawg_client_config
 
 
 class ProfileSurfaceError(RuntimeError):
@@ -126,7 +127,7 @@ def update_owned_profile_label(
     return profile
 
 
-def build_owned_wireguard_config(
+def build_owned_profile_config(
     db: Session,
     *,
     user,
@@ -137,7 +138,7 @@ def build_owned_wireguard_config(
     audit_actor_user_id: uuid.UUID | None = None,
 ) -> str:
     profile = _owned_profile(db, user_id=user.id, profile_id=profile_id)
-    if profile.protocol != "wireguard":
+    if profile.protocol not in {"wireguard", "amneziawg"}:
         raise ProfileNotReady("unsupported protocol")
     if profile.status != "active" or not profile.tunnel_ip:
         raise ProfileNotReady("profile is not active")
@@ -147,7 +148,10 @@ def build_owned_wireguard_config(
     preshared_key = secret.get("preshared_key", "")
     if not private_key or not preshared_key:
         raise ProfileNotReady("credential is unavailable")
-    config_text = build_client_config(private_key, profile.tunnel_ip, preshared_key)
+    if profile.protocol == "wireguard":
+        config_text = build_wireguard_client_config(private_key, profile.tunnel_ip, preshared_key)
+    else:
+        config_text = build_amneziawg_client_config(private_key, profile.tunnel_ip, preshared_key)
     record_audit_event(
         db,
         event_type=audit_event,
@@ -156,7 +160,7 @@ def build_owned_wireguard_config(
         object_type="connection_profile",
         object_id=str(profile.id),
         request_id=request_id,
-        payload={"credential_revision": credential.revision},
+        payload={"credential_revision": credential.revision, "protocol": profile.protocol},
     )
     return config_text
 
@@ -204,7 +208,7 @@ def reissue_owned_profile(
     request_id: str | None,
 ):
     profile = _owned_profile(db, user_id=user.id, profile_id=profile_id, for_update=True)
-    if profile.protocol != "wireguard":
+    if profile.protocol not in {"wireguard", "amneziawg"}:
         raise ProfileSurfaceError("unsupported protocol")
     if profile.status != "disabled" or profile.tunnel_ip is not None:
         raise ProfileSurfaceError("profile must be fully disabled before reissue")
@@ -212,7 +216,7 @@ def reissue_owned_profile(
     if grant is None or grant.user_id != user.id or not grant_is_active(grant, now=utcnow()):
         raise ProfileSurfaceError("grant unavailable")
     try:
-        job, created = prepare_wireguard_profile_provisioning(db, profile=profile)
+        job, created = prepare_profile_provisioning(db, profile=profile)
     except DomainV2Error as exc:
         raise ProfileSurfaceError("reissue rejected") from exc
     record_audit_event(

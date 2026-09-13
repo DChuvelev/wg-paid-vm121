@@ -63,7 +63,7 @@ from app.services.profile_delivery import (
     ProfileNotReady,
     ProfileSurfaceError,
     ProfileUnavailable,
-    build_owned_wireguard_config,
+    build_owned_profile_config,
     build_qr_svg,
     create_owned_profile,
     list_owned_profiles,
@@ -879,7 +879,7 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
                         profile_limit=limit.profile_limit,
                         profile_count=usage_by_grant_protocol.get((g.id, limit.protocol), 0),
                         can_create=(
-                            limit.protocol == "wireguard"
+                            limit.protocol in {"wireguard", "amneziawg"}
                             and grant_is_active(g)
                             and usage_by_grant_protocol.get((g.id, limit.protocol), 0) < limit.profile_limit
                         ),
@@ -971,7 +971,7 @@ class ProfileMutationResponse(BaseModel):
 
 class ProfileCreateRequest(BaseModel):
     grant_id: UUID
-    protocol: Literal["wireguard"] = "wireguard"
+    protocol: Literal["wireguard", "amneziawg"] = "wireguard"
     label: str | None = Field(default=None, max_length=160)
 
 
@@ -1138,7 +1138,7 @@ def account_profile_config_download(
         raise HTTPException(status_code=404, detail="download unavailable") from exc
 
     try:
-        config_text = build_owned_wireguard_config(
+        config_text = build_owned_profile_config(
             db,
             user=user,
             profile_id=profile_id,
@@ -1181,7 +1181,7 @@ def account_profile_config(
 ):
     _, user = current
     try:
-        config_text = build_owned_wireguard_config(
+        config_text = build_owned_profile_config(
             db,
             user=user,
             profile_id=profile_id,
@@ -1219,7 +1219,7 @@ def account_profile_qr(
 ):
     _, user = current
     try:
-        config_text = build_owned_wireguard_config(
+        config_text = build_owned_profile_config(
             db,
             user=user,
             profile_id=profile_id,
@@ -1464,7 +1464,7 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
                     profile_limit=limit.profile_limit,
                     profile_count=usage_by_grant_protocol.get((grant.id, limit.protocol), 0),
                     can_create=(
-                        limit.protocol == "wireguard"
+                        limit.protocol in {"wireguard", "amneziawg"}
                         and grant_is_active(grant)
                         and usage_by_grant_protocol.get((grant.id, limit.protocol), 0) < limit.profile_limit
                     ),
@@ -1692,10 +1692,10 @@ def admin_profile_config_download(
     user = db.get(User, profile.user_id)
     if user is None or user.deletion_requested_at is not None:
         raise HTTPException(status_code=404, detail="profile not found")
-    if profile.protocol != "wireguard" or profile.status != "active" or not profile.tunnel_ip:
+    if profile.protocol not in {"wireguard", "amneziawg"} or profile.status != "active" or not profile.tunnel_ip:
         raise HTTPException(status_code=409, detail="profile is not ready")
     try:
-        config_text = build_owned_wireguard_config(
+        config_text = build_owned_profile_config(
             db,
             user=user,
             profile_id=profile_id,
@@ -2104,7 +2104,7 @@ def admin_set_protocol_limit(
         profile_limit=int(limit_row.profile_limit),
         profile_count=current_count,
         can_create=(
-            protocol == "wireguard"
+            protocol in {"wireguard", "amneziawg"}
             and grant_is_active(grant)
             and current_count < int(limit_row.profile_limit)
         ),

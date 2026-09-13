@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from uuid import UUID
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -29,6 +30,7 @@ def check_agent_token(x_agent_token: str | None = Header(default=None)):
 class AgentPeerResponse(BaseModel):
     id: UUID
     node_id: str
+    protocol: Literal["wireguard", "amneziawg"] = "wireguard"
     public_key: str
     preshared_key: str
     tunnel_ip: str
@@ -42,24 +44,26 @@ class AgentPeerResponse(BaseModel):
 @router.get("/peers", response_model=list[AgentPeerResponse])
 def get_enabled_peers(
     node_id: str,
+    protocol: Literal["wireguard", "amneziawg"] = "wireguard",
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
     result: list[AgentPeerResponse] = []
 
-    legacy = db.execute(
-        select(Peer)
-        .where(Peer.node_id == node_id)
-        .where(Peer.enabled == True)
-        .order_by(Peer.created_at.asc())
-    ).scalars().all()
-    for row in legacy:
-        result.append(AgentPeerResponse.model_validate(row))
+    if protocol == "wireguard":
+        legacy = db.execute(
+            select(Peer)
+            .where(Peer.node_id == node_id)
+            .where(Peer.enabled == True)
+            .order_by(Peer.created_at.asc())
+        ).scalars().all()
+        for row in legacy:
+            result.append(AgentPeerResponse.model_validate(row))
 
     profiles = db.execute(
         select(ConnectionProfile)
         .where(ConnectionProfile.node_id == node_id)
-        .where(ConnectionProfile.protocol == "wireguard")
+        .where(ConnectionProfile.protocol == protocol)
         .where(ConnectionProfile.status.in_(("provisioning", "active")))
         .where(ConnectionProfile.tunnel_ip.is_not(None))
         .order_by(ConnectionProfile.created_at.asc())
@@ -86,6 +90,7 @@ def get_enabled_peers(
             AgentPeerResponse(
                 id=profile.id,
                 node_id=profile.node_id,
+                protocol=profile.protocol,
                 public_key=credential.public_key,
                 preshared_key=psk,
                 tunnel_ip=profile.tunnel_ip,
@@ -121,16 +126,22 @@ class FailRequest(BaseModel):
 @router.get("/jobs", response_model=list[AgentJobResponse])
 def get_pending_jobs(
     node_id: str,
+    protocol: Literal["wireguard", "amneziawg"] = "wireguard",
     limit: int = 10,
     db: Session = Depends(get_db),
     _: None = Depends(check_agent_token),
 ):
     now = datetime.now(timezone.utc)
+    profile_ids = select(ConnectionProfile.id).where(ConnectionProfile.protocol == protocol)
+    visibility = ProvisioningJob.connection_profile_id.in_(profile_ids)
+    if protocol == "wireguard":
+        visibility = or_(ProvisioningJob.connection_profile_id.is_(None), visibility)
     rows = db.execute(
         select(ProvisioningJob)
         .where(ProvisioningJob.node_id == node_id)
         .where(ProvisioningJob.status == "pending")
         .where(or_(ProvisioningJob.next_attempt_at.is_(None), ProvisioningJob.next_attempt_at <= now))
+        .where(visibility)
         .order_by(ProvisioningJob.created_at.asc())
         .limit(limit)
     ).scalars().all()
