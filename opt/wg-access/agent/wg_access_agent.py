@@ -54,7 +54,7 @@ REMOTE_REGISTRY_FILE = env.get(
     "REMOTE_REGISTRY_FILE",
     "/etc/router-wgpay-peer-state/registry.tsv",
 )
-PROTOCOL_CODE = "wireguard"
+MANAGED_PROTOCOLS = ("wireguard", "amneziawg")
 
 
 def log(msg):
@@ -139,7 +139,19 @@ def require_tunnel_ip(value):
     return str(ip)
 
 
-def normalize_peer_payload(peer):
+def require_protocol(value, *, expected=None):
+    protocol = str(value or "").strip()
+    if protocol not in MANAGED_PROTOCOLS:
+        raise RuntimeError(f"unsupported managed protocol: {protocol or 'missing'}")
+    if expected is not None and protocol != expected:
+        raise RuntimeError(
+            f"backend protocol mismatch expected={expected} actual={protocol}"
+        )
+    return protocol
+
+
+def normalize_peer_payload(peer, *, expected_protocol):
+    protocol = require_protocol(peer.get("protocol"), expected=expected_protocol)
     public_key = require_wg_key("public_key", peer["public_key"])
     preshared_key = require_wg_key("preshared_key", peer["preshared_key"])
     tunnel_ip = require_tunnel_ip(peer["tunnel_ip"])
@@ -151,7 +163,7 @@ def normalize_peer_payload(peer):
     return {
         "id": peer_id,
         "node_id": peer.get("node_id", NODE_ID),
-        "protocol": PROTOCOL_CODE,
+        "protocol": protocol,
         "public_key": public_key,
         "preshared_key": preshared_key,
         "tunnel_ip": tunnel_ip,
@@ -401,16 +413,30 @@ IFS= read -r desired_generation
         raise RuntimeError("VM100 lifecycle disable did not return an accepted result")
 
 
-def sync_enabled_peers():
-    query = parse.urlencode({"node_id": NODE_ID})
-    rows = http_json("GET", f"/agent/peers?{query}") or []
+def fetch_enabled_peers():
     desired = {}
 
-    for row in rows:
-        peer = normalize_peer_payload(row)
-        desired[peer["public_key"]] = peer
+    for protocol in MANAGED_PROTOCOLS:
+        query = parse.urlencode({"node_id": NODE_ID, "protocol": protocol})
+        rows = http_json("GET", f"/agent/peers?{query}") or []
 
-    log(f"sync desired enabled peers: {len(desired)}")
+        for row in rows:
+            peer = normalize_peer_payload(row, expected_protocol=protocol)
+            public_key = peer["public_key"]
+            if public_key in desired:
+                raise RuntimeError(
+                    "duplicate public key across managed protocol desired state"
+                )
+            desired[public_key] = peer
+
+        log(f"sync desired enabled peers protocol={protocol}: {len(rows)}")
+
+    return desired
+
+
+def sync_enabled_peers():
+    desired = fetch_enabled_peers()
+    log(f"sync desired enabled peers total: {len(desired)}")
 
     registry_before = remote_registry()
     log(f"sync VM100 lifecycle registry peers before: {len(registry_before)}")
@@ -420,35 +446,37 @@ def sync_enabled_peers():
         profile_id, mode = lifecycle_enable_or_ensure(peer)
         log(
             "sync lifecycle "
-            f"{mode} peer_id={peer['id']} profile_id={profile_id} "
-            f"tunnel_ip={peer['tunnel_ip']}"
+            f"{mode} protocol={peer['protocol']} peer_id={peer['id']} "
+            f"profile_id={profile_id} tunnel_ip={peer['tunnel_ip']}"
         )
 
     registry_mid = remote_registry()
-    desired_keys = set(desired.keys())
-
     for row in sorted(registry_mid, key=lambda item: item["profile_id"]):
-        if row["protocol"] != PROTOCOL_CODE:
+        if row["protocol"] not in MANAGED_PROTOCOLS:
             continue
-        if row["public_key"] in desired_keys:
+        peer = desired.get(row["public_key"])
+        if peer is not None and peer["protocol"] == row["protocol"]:
             continue
         lifecycle_disable_profile(
             row["profile_id"],
-            reason_seed=f"{row['public_key']}|{row['tunnel_ip']}",
+            reason_seed=(
+                f"{row['protocol']}|{row['public_key']}|{row['tunnel_ip']}"
+            ),
         )
         log(
             "sync lifecycle --disable "
-            f"profile_id={row['profile_id']} tunnel_ip={row['tunnel_ip']}"
+            f"protocol={row['protocol']} profile_id={row['profile_id']} "
+            f"tunnel_ip={row['tunnel_ip']}"
         )
 
     registry_after = remote_registry()
     actual = {
-        (row["public_key"], row["tunnel_ip"])
+        (row["protocol"], row["public_key"], row["tunnel_ip"])
         for row in registry_after
-        if row["protocol"] == PROTOCOL_CODE
+        if row["protocol"] in MANAGED_PROTOCOLS
     }
     expected = {
-        (peer["public_key"], peer["tunnel_ip"])
+        (peer["protocol"], peer["public_key"], peer["tunnel_ip"])
         for peer in desired.values()
     }
     if actual != expected:
@@ -476,9 +504,55 @@ def sync_enabled_peers():
     return desired, registry_after
 
 
-def verify_job_against_reconciled_state(job, desired, registry_rows):
+def resolve_job_protocol(job, *, expected_protocol):
+    payload = job.get("payload_json") or {}
+    payload_protocol = payload.get("protocol")
+
+    if payload_protocol is None:
+        # Legacy Peer jobs predate ConnectionProfile.protocol. They are part of
+        # the WireGuard compatibility surface only.
+        if expected_protocol == "wireguard" and not job.get("connection_profile_id"):
+            return "wireguard"
+        raise RuntimeError("profile job is missing payload protocol")
+
+    return require_protocol(payload_protocol, expected=expected_protocol)
+
+
+def fetch_pending_jobs():
+    pending = []
+    seen = set()
+
+    for protocol in MANAGED_PROTOCOLS:
+        query = parse.urlencode({
+            "node_id": NODE_ID,
+            "protocol": protocol,
+            "limit": 20,
+        })
+        rows = http_json("GET", f"/agent/jobs?{query}") or []
+        for job in rows:
+            job_id = str(job.get("id") or "")
+            if not job_id:
+                raise RuntimeError("job id is required")
+            if job_id in seen:
+                raise RuntimeError(f"duplicate job across protocol queues: {job_id}")
+            resolve_job_protocol(job, expected_protocol=protocol)
+            seen.add(job_id)
+            pending.append((protocol, job))
+        log(f"pending jobs protocol={protocol}: {len(rows)}")
+
+    return pending
+
+
+def verify_job_against_reconciled_state(
+    job,
+    desired,
+    registry_rows,
+    *,
+    expected_protocol,
+):
     action = job["action"]
     payload = job["payload_json"]
+    protocol = resolve_job_protocol(job, expected_protocol=expected_protocol)
     peer_id = str(job.get("peer_id") or job.get("connection_profile_id") or "")
 
     if action in {"enable_peer", "provision_profile"}:
@@ -490,27 +564,38 @@ def verify_job_against_reconciled_state(job, desired, registry_rows):
                 for item in registry_rows
                 if item["public_key"] == public_key
                 and item["tunnel_ip"] == tunnel_ip
-                and item["protocol"] == PROTOCOL_CODE
+                and item["protocol"] == protocol
             ),
             None,
         )
-        if row is None or public_key not in desired:
+        desired_peer = desired.get(public_key)
+        if (
+            row is None
+            or desired_peer is None
+            or desired_peer["protocol"] != protocol
+        ):
             raise RuntimeError(
                 f"enable job not satisfied by lifecycle reconcile peer_id={peer_id}"
             )
         log(
             f"REAL {action} verified via VM100 lifecycle "
-            f"peer_id={peer_id} tunnel_ip={tunnel_ip}"
+            f"protocol={protocol} peer_id={peer_id} tunnel_ip={tunnel_ip}"
         )
         return
 
     if action in {"disable_peer", "disable_profile"}:
         public_key = require_wg_key("public_key", payload["public_key"])
-        if any(item["public_key"] == public_key for item in registry_rows):
+        if any(
+            item["protocol"] == protocol and item["public_key"] == public_key
+            for item in registry_rows
+        ):
             raise RuntimeError(
                 f"disable job still present in VM100 lifecycle registry peer_id={peer_id}"
             )
-        log(f"REAL {action} verified via VM100 lifecycle peer_id={peer_id}")
+        log(
+            f"REAL {action} verified via VM100 lifecycle "
+            f"protocol={protocol} peer_id={peer_id}"
+        )
         return
 
     raise RuntimeError(f"unsupported action: {action}")
@@ -518,33 +603,39 @@ def verify_job_against_reconciled_state(job, desired, registry_rows):
 
 def run_once():
     # VM121 owns desired membership only. VM100 lifecycle owns runtime peer +
-    # selector membership transaction. The agent never executes direct WireGuard writes.
+    # selector membership transaction. The agent never executes direct runtime writes.
     desired, registry_rows = sync_enabled_peers()
+    pending = fetch_pending_jobs()
 
-    query = parse.urlencode({"node_id": NODE_ID, "limit": 20})
-    jobs = http_json("GET", f"/agent/jobs?{query}") or []
-
-    if not jobs:
+    if not pending:
         log("no pending jobs")
         return 0
 
-    log(f"fetched pending jobs: {len(jobs)}")
+    log(f"fetched pending jobs total: {len(pending)}")
 
-    for job in jobs:
+    for protocol, job in pending:
         job_id = job["id"]
-        log(f"starting job_id={job_id} action={job['action']}")
+        log(
+            f"starting job_id={job_id} protocol={protocol} "
+            f"action={job['action']}"
+        )
 
         try:
             started = http_json("POST", f"/agent/jobs/{job_id}/start")
-            verify_job_against_reconciled_state(started, desired, registry_rows)
+            verify_job_against_reconciled_state(
+                started,
+                desired,
+                registry_rows,
+                expected_protocol=protocol,
+            )
             completed = http_json("POST", f"/agent/jobs/{job_id}/complete")
             log(
-                f"completed job_id={completed['id']} "
+                f"completed job_id={completed['id']} protocol={protocol} "
                 f"status={completed['status']} attempts={completed['attempts']}"
             )
         except Exception as exc:
             err = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-            log(f"failed job_id={job_id}: {err}")
+            log(f"failed job_id={job_id} protocol={protocol}: {err}")
             try:
                 http_json("POST", f"/agent/jobs/{job_id}/fail", {"error": err})
             except Exception as fail_exc:
