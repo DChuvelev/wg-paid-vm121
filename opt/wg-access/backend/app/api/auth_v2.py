@@ -20,7 +20,18 @@ from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_m
 from app.agent_trigger import trigger_wg_access_agent_best_effort
 from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
 from app.db.session import get_db
-from app.models import AccessGrant, AccessGrantProtocolLimit, AuthSession, ConnectionProfile, Invite, InviteRedemption, MagicLinkToken, Plan, User
+from app.models import (
+    AccessGrant,
+    AccessGrantProtocolLimit,
+    AuthSession,
+    ConnectionProfile,
+    ConnectionSlot,
+    Invite,
+    InviteRedemption,
+    MagicLinkToken,
+    Plan,
+    User,
+)
 from app.services.auth_v2 import (
     AuthV2Error,
     InviteRejected,
@@ -51,7 +62,10 @@ from app.services.domain_v2 import (
     InvalidIdentity,
     PROFILE_QUOTA_STATUSES,
     grant_is_active,
+    logical_slot_count,
+    mirrored_configuration_limit,
     record_audit_event,
+    request_configuration_disable,
     request_profile_disable,
     utcnow,
 )
@@ -65,8 +79,10 @@ from app.services.profile_delivery import (
     ProfileUnavailable,
     build_owned_profile_config,
     build_qr_svg,
+    create_owned_configuration,
     create_owned_profile,
     list_owned_profiles,
+    profile_slot_ordinal,
     update_owned_profile_label,
 )
 
@@ -846,21 +862,18 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
             limits_by_grant.setdefault(row.access_grant_id, []).append(row)
 
         usage_rows = db.execute(
-            select(
-                ConnectionProfile.access_grant_id,
-                ConnectionProfile.protocol,
-                func.count(ConnectionProfile.id),
-            )
+            select(ConnectionSlot.access_grant_id, func.count(ConnectionSlot.id))
             .where(
-                ConnectionProfile.user_id == user.id,
-                ConnectionProfile.access_grant_id.in_(grant_ids),
-                ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+                ConnectionSlot.user_id == user.id,
+                ConnectionSlot.access_grant_id.in_(grant_ids),
+                ConnectionSlot.disabled_at.is_(None),
             )
-            .group_by(ConnectionProfile.access_grant_id, ConnectionProfile.protocol)
+            .group_by(ConnectionSlot.access_grant_id)
         ).all()
         usage_by_grant_protocol = {
             (grant_id, protocol): int(count)
-            for grant_id, protocol, count in usage_rows
+            for grant_id, count in usage_rows
+            for protocol in ("wireguard", "amneziawg")
         }
 
     return AccountMeResponse(
@@ -1007,7 +1020,7 @@ def account_profiles(
     return [
         _profile_summary(row)
         for row in rows
-        if row.status in PROFILE_QUOTA_STATUSES
+        if row.protocol == "wireguard" and row.status in PROFILE_QUOTA_STATUSES
     ]
 
 
@@ -1144,14 +1157,7 @@ def account_profile_config_download(
             profile_id=profile_id,
             request_id=_request_id(request),
         )
-        profile_ordinal = next(
-            (
-                index
-                for index, owned in enumerate(list_owned_profiles(db, user=user), start=1)
-                if owned.id == profile_id
-            ),
-            0,
-        )
+        profile_ordinal = profile_slot_ordinal(db, user=user, profile_id=profile_id)
         if profile_ordinal == 0:
             raise ProfileUnavailable("profile unavailable")
         db.commit()
@@ -1187,10 +1193,7 @@ def account_profile_config(
             profile_id=profile_id,
             request_id=_request_id(request),
         )
-        profile_ordinal = next(
-            (index for index, owned in enumerate(list_owned_profiles(db, user=user), start=1) if owned.id == profile_id),
-            0,
-        )
+        profile_ordinal = profile_slot_ordinal(db, user=user, profile_id=profile_id)
         if profile_ordinal == 0:
             raise ProfileUnavailable("profile unavailable")
         db.commit()
@@ -1361,6 +1364,24 @@ class AdminProtocolLimitUpdateResponse(BaseModel):
     retirement_in_progress: bool
 
 
+class AdminConfigurationCreateRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=160)
+
+
+class ConfigurationVariantMutation(BaseModel):
+    protocol: str
+    profile: ProfileSummary
+    job_id: UUID
+    job_created: bool
+
+
+class AdminConfigurationCreateResponse(BaseModel):
+    configuration_id: UUID
+    access_grant_id: UUID
+    label: str | None
+    variants: list[ConfigurationVariantMutation]
+
+
 def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None = None) -> AdminInviteSummary:
     point = now or utcnow()
     state = _invite_lifecycle_state(invite, now=point)
@@ -1435,21 +1456,18 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
             limits_by_grant.setdefault(row.access_grant_id, []).append(row)
 
         usage_rows = db.execute(
-            select(
-                ConnectionProfile.access_grant_id,
-                ConnectionProfile.protocol,
-                func.count(ConnectionProfile.id),
-            )
+            select(ConnectionSlot.access_grant_id, func.count(ConnectionSlot.id))
             .where(
-                ConnectionProfile.user_id == user.id,
-                ConnectionProfile.access_grant_id.in_(grant_ids),
-                ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+                ConnectionSlot.user_id == user.id,
+                ConnectionSlot.access_grant_id.in_(grant_ids),
+                ConnectionSlot.disabled_at.is_(None),
             )
-            .group_by(ConnectionProfile.access_grant_id, ConnectionProfile.protocol)
+            .group_by(ConnectionSlot.access_grant_id)
         ).all()
         usage_by_grant_protocol = {
             (grant_id, protocol): int(count)
-            for grant_id, protocol, count in usage_rows
+            for grant_id, count in usage_rows
+            for protocol in ("wireguard", "amneziawg")
         }
 
     return [
@@ -1677,6 +1695,58 @@ def admin_revoke_invite(
     return _admin_invite_summary(db, invite, now=now)
 
 
+@router.post(
+    "/admin/grants/{grant_id}/configurations",
+    response_model=AdminConfigurationCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_create_configuration(
+    grant_id: UUID,
+    payload: AdminConfigurationCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    grant = db.get(AccessGrant, grant_id)
+    if grant is None:
+        raise HTTPException(status_code=404, detail="grant not found")
+    user = db.get(User, grant.user_id)
+    if user is None or user.deletion_requested_at is not None:
+        raise HTTPException(status_code=404, detail="grant not found")
+    try:
+        result = create_owned_configuration(
+            db,
+            user=user,
+            grant_id=grant.id,
+            node_id=settings.wg_default_node_id,
+            label=(str(payload.label).strip() or None) if payload.label is not None else None,
+            request_id=_request_id(request),
+            actor_kind="admin",
+        )
+        db.commit()
+        for profile in result.profiles.values():
+            db.refresh(profile)
+        db.refresh(result.slot)
+        trigger_wg_access_agent_best_effort()
+    except ProfileSurfaceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="configuration cannot be created") from exc
+    return AdminConfigurationCreateResponse(
+        configuration_id=result.slot.id,
+        access_grant_id=result.slot.access_grant_id,
+        label=result.slot.label,
+        variants=[
+            ConfigurationVariantMutation(
+                protocol=protocol,
+                profile=_profile_summary(result.profiles[protocol]),
+                job_id=result.jobs[protocol].id,
+                job_created=result.created_jobs[protocol],
+            )
+            for protocol in ("wireguard", "amneziawg")
+        ],
+    )
+
+
 @router.get(
     "/admin/profiles/{profile_id}/config",
     dependencies=[Depends(_require_admin)],
@@ -1703,14 +1773,7 @@ def admin_profile_config_download(
             audit_event="admin.profile.config.delivered",
             audit_actor_kind="admin",
         )
-        profile_ordinal = next(
-            (
-                index
-                for index, owned in enumerate(list_owned_profiles(db, user=user), start=1)
-                if owned.id == profile_id
-            ),
-            0,
-        )
+        profile_ordinal = profile_slot_ordinal(db, user=user, profile_id=profile_id)
         if profile_ordinal == 0:
             raise ProfileUnavailable("profile unavailable")
         db.commit()
@@ -1988,6 +2051,8 @@ def admin_set_protocol_limit(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    # Compatibility route name retained until the Admin UI is converted to one
+    # configuration limit. Both stored protocol rows are always updated together.
     if protocol not in {"wireguard", "amneziawg"}:
         raise HTTPException(status_code=400, detail="unsupported protocol")
     grant = db.execute(
@@ -1995,36 +2060,38 @@ def admin_set_protocol_limit(
     ).scalar_one_or_none()
     if grant is None:
         raise HTTPException(status_code=404, detail="grant not found")
-    limit_row = db.execute(
+
+    limit_rows = db.execute(
         select(AccessGrantProtocolLimit)
         .where(
             AccessGrantProtocolLimit.access_grant_id == grant.id,
-            AccessGrantProtocolLimit.protocol == protocol,
+            AccessGrantProtocolLimit.protocol.in_(("wireguard", "amneziawg")),
         )
         .with_for_update()
-    ).scalar_one_or_none()
-    if limit_row is None:
-        raise HTTPException(status_code=404, detail="protocol limit not found")
-
-    prior_limit = int(limit_row.profile_limit)
+    ).scalars().all()
+    by_protocol = {row.protocol: row for row in limit_rows}
+    if set(by_protocol) != {"wireguard", "amneziawg"}:
+        raise HTTPException(status_code=409, detail="configuration limit mirror is incomplete")
+    prior_limit = mirrored_configuration_limit(db, grant_id=grant.id)
     new_limit = int(payload.profile_limit)
+
     selected_ids = list(payload.retire_profile_ids)
     if len(set(selected_ids)) != len(selected_ids):
         raise HTTPException(status_code=400, detail="duplicate retirement profile ids")
 
-    quota_profiles = db.execute(
-        select(ConnectionProfile)
+    quota_slots = db.execute(
+        select(ConnectionSlot)
         .where(
-            ConnectionProfile.access_grant_id == grant.id,
-            ConnectionProfile.protocol == protocol,
-            ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
+            ConnectionSlot.access_grant_id == grant.id,
+            ConnectionSlot.disabled_at.is_(None),
         )
-        .order_by(ConnectionProfile.created_at.asc(), ConnectionProfile.id.asc())
+        .order_by(ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
         .with_for_update()
     ).scalars().all()
-    current_count = len(quota_profiles)
+    current_count = len(quota_slots)
     required_reduction = max(0, current_count - new_limit)
 
+    selected_slot_ids: list[UUID] = []
     if required_reduction == 0:
         if selected_ids:
             raise HTTPException(
@@ -2032,84 +2099,95 @@ def admin_set_protocol_limit(
                 detail="retirement profile ids are not allowed when no reduction is required",
             )
     else:
-        if protocol != "wireguard":
-            raise HTTPException(
-                status_code=409,
-                detail="profile retirement is not supported for this protocol",
-            )
         if len(selected_ids) != required_reduction:
             raise HTTPException(
                 status_code=409,
-                detail=f"exactly {required_reduction} profile(s) must be selected for retirement",
+                detail=f"exactly {required_reduction} configuration(s) must be selected for retirement",
             )
-        eligible_ids = {profile.id for profile in quota_profiles}
-        if any(profile_id not in eligible_ids for profile_id in selected_ids):
+        selected_profiles = db.execute(
+            select(ConnectionProfile)
+            .where(ConnectionProfile.id.in_(selected_ids))
+            .with_for_update()
+        ).scalars().all()
+        if len(selected_profiles) != len(selected_ids):
+            raise HTTPException(status_code=409, detail="selected profile not found")
+        eligible_slot_ids = {slot.id for slot in quota_slots}
+        for selected in selected_profiles:
+            if selected.access_grant_id != grant.id or selected.connection_slot_id not in eligible_slot_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail="selected profiles must belong to active configurations of this grant",
+                )
+            selected_slot_ids.append(selected.connection_slot_id)
+        if len(set(selected_slot_ids)) != required_reduction:
             raise HTTPException(
                 status_code=409,
-                detail="selected profiles must belong to this grant/protocol and consume quota",
+                detail="selected profiles must identify distinct configurations",
             )
 
     disable_jobs_created = 0
     req = _request_id(request)
-    for profile_id in selected_ids:
+    for slot_id in selected_slot_ids:
         try:
-            profile, job, created = request_profile_disable(db, profile_id=profile_id)
+            disable_results = request_configuration_disable(db, slot_id=slot_id)
         except DomainV2Error as exc:
             db.rollback()
             raise HTTPException(
                 status_code=409,
-                detail="selected profile cannot be retired in its current state",
+                detail="selected configuration cannot be retired in its current state",
             ) from exc
-        disable_jobs_created += int(created)
+        disable_jobs_created += sum(int(created) for _, _, created in disable_results)
         record_audit_event(
             db,
-            event_type="profile.retirement.requested",
+            event_type="configuration.retirement.requested",
             actor_kind="admin",
-            object_type="connection_profile",
-            object_id=str(profile.id),
+            object_type="connection_slot",
+            object_id=str(slot_id),
             request_id=req,
             payload={
                 "access_grant_id": str(grant.id),
-                "protocol": protocol,
-                "job_id": str(job.id),
-                "job_created": bool(created),
+                "variant_jobs": [
+                    {
+                        "protocol": profile_row.protocol,
+                        "job_id": str(job.id),
+                        "job_created": bool(created),
+                    }
+                    for profile_row, job, created in disable_results
+                ],
             },
         )
 
-    limit_row.profile_limit = new_limit
+    for row in by_protocol.values():
+        row.profile_limit = new_limit
     record_audit_event(
         db,
-        event_type="grant.protocol_limit.updated",
+        event_type="grant.configuration_limit.updated",
         actor_kind="admin",
         object_type="access_grant",
         object_id=str(grant.id),
         request_id=req,
         payload={
-            "protocol": protocol,
             "prior_profile_limit": prior_limit,
             "profile_limit": new_limit,
-            "profile_count_before": current_count,
+            "configuration_count_before": current_count,
             "required_reduction": required_reduction,
             "retire_profile_ids": [str(profile_id) for profile_id in selected_ids],
+            "retire_configuration_ids": [str(slot_id) for slot_id in selected_slot_ids],
             "disable_jobs_created": disable_jobs_created,
         },
     )
     db.commit()
-    db.refresh(limit_row)
-    if selected_ids:
+    for row in by_protocol.values():
+        db.refresh(row)
+    if selected_slot_ids:
         trigger_wg_access_agent_best_effort()
     return AdminProtocolLimitUpdateResponse(
         access_grant_id=grant.id,
         protocol=protocol,
-        profile_limit=int(limit_row.profile_limit),
+        profile_limit=new_limit,
         profile_count=current_count,
-        can_create=(
-            protocol in {"wireguard", "amneziawg"}
-            and grant_is_active(grant)
-            and current_count < int(limit_row.profile_limit)
-        ),
+        can_create=(grant_is_active(grant) and current_count < new_limit),
         retire_profile_ids=selected_ids,
         disable_jobs_created=disable_jobs_created,
-        retirement_in_progress=bool(selected_ids),
+        retirement_in_progress=bool(selected_slot_ids),
     )
-

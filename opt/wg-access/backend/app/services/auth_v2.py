@@ -881,15 +881,16 @@ def consume_magic_link(
                 valid_until=None,
             )
 
-            wg_limit = protocol_limit(db, grant_id=grant.id, protocol="wireguard")
-            wg_limit.profile_limit = (
+            slot_limit = (
                 int(invite.wireguard_profile_limit)
                 if invite.wireguard_profile_limit is not None
                 else int(plan.default_wireguard_limit)
             )
+            for protocol_name in ("wireguard", "amneziawg"):
+                protocol_limit(db, grant_id=grant.id, protocol=protocol_name).profile_limit = slot_limit
             db.flush()
-            effective_wg_limit = int(wg_limit.profile_limit)
-            if wg_limit.profile_limit > 0:
+            effective_wg_limit = slot_limit
+            if slot_limit > 0:
                 profile_result = create_profile_request(
                     db,
                     user=user,
@@ -909,7 +910,7 @@ def consume_magic_link(
                     object_type="connection_profile",
                     object_id=str(profile_result.profile.id),
                     request_id=req,
-                    payload={"protocol": "wireguard", "reason": "initial_registration"},
+                    payload={"protocol": "wireguard", "paired_protocol": "amneziawg", "reason": "initial_registration"},
                 )
 
         row.user_id = user.id

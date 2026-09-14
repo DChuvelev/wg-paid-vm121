@@ -9,11 +9,13 @@ from qrcode.image.svg import SvgPathImage
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AccessGrant, ConnectionProfile
+from app.models import AccessGrant, ConnectionProfile, ConnectionSlot
 from app.services.credential_service import decrypt_profile_credential
 from app.services.domain_v2 import (
     DomainV2Error,
+    ConfigurationRequestResult,
     ProfileRequestResult,
+    create_configuration_request,
     create_profile_request,
     current_profile_credential,
     grant_is_active,
@@ -67,6 +69,39 @@ def list_owned_profiles(db: Session, *, user) -> list[ConnectionProfile]:
     )
 
 
+def create_owned_configuration(
+    db: Session,
+    *,
+    user,
+    grant_id: uuid.UUID,
+    node_id: str,
+    label: str | None,
+    request_id: str | None,
+    actor_kind: str = "user",
+) -> ConfigurationRequestResult:
+    try:
+        result = create_configuration_request(
+            db,
+            user=user,
+            grant_id=grant_id,
+            node_id=node_id,
+            label=label,
+        )
+    except DomainV2Error as exc:
+        raise ProfileSurfaceError("configuration request rejected") from exc
+    record_audit_event(
+        db,
+        event_type="configuration.requested",
+        actor_kind=actor_kind,
+        actor_user_id=(user.id if actor_kind == "user" else None),
+        object_type="connection_slot",
+        object_id=str(result.slot.id),
+        request_id=request_id,
+        payload={"protocols": ["wireguard", "amneziawg"]},
+    )
+    return result
+
+
 def create_owned_profile(
     db: Session,
     *,
@@ -96,7 +131,7 @@ def create_owned_profile(
         object_type="connection_profile",
         object_id=str(result.profile.id),
         request_id=request_id,
-        payload={"protocol": protocol},
+        payload={"protocol": protocol, "paired_protocol": ("amneziawg" if protocol == "wireguard" else "wireguard")},
     )
     return result
 
@@ -111,20 +146,54 @@ def update_owned_profile_label(
 ) -> ConnectionProfile:
     profile = _owned_profile(db, user_id=user.id, profile_id=profile_id, for_update=True)
     normalized = str(label).strip() if label is not None else ""
-    profile.label = normalized or None
-    profile.updated_at = utcnow()
+    slot = db.execute(
+        select(ConnectionSlot)
+        .where(ConnectionSlot.id == profile.connection_slot_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if slot is None:
+        raise ProfileUnavailable("configuration unavailable")
+    value = normalized or None
+    slot.label = value
+    slot.updated_at = utcnow()
+    siblings = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.connection_slot_id == slot.id)
+        .with_for_update()
+    ).scalars().all()
+    for sibling in siblings:
+        sibling.label = value
+        sibling.updated_at = slot.updated_at
     record_audit_event(
         db,
-        event_type="profile.label.updated",
+        event_type="configuration.label.updated",
         actor_kind="user",
         actor_user_id=user.id,
-        object_type="connection_profile",
-        object_id=str(profile.id),
+        object_type="connection_slot",
+        object_id=str(slot.id),
         request_id=request_id,
-        payload={"label_set": profile.label is not None},
+        payload={"label_set": value is not None},
     )
     db.flush()
     return profile
+
+
+def profile_slot_ordinal(
+    db: Session,
+    *,
+    user,
+    profile_id: uuid.UUID,
+) -> int:
+    profile = _owned_profile(db, user_id=user.id, profile_id=profile_id)
+    slot_ids = db.execute(
+        select(ConnectionSlot.id)
+        .where(ConnectionSlot.user_id == user.id)
+        .order_by(ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
+    ).scalars().all()
+    try:
+        return list(slot_ids).index(profile.connection_slot_id) + 1
+    except ValueError:
+        return 0
 
 
 def build_owned_profile_config(

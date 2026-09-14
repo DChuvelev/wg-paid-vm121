@@ -145,10 +145,27 @@ class AuthSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ConnectionSlot(Base):
+    __tablename__ = "connection_slots"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Legacy rows may retain owner UUIDs whose users were historically deleted.
+    # New application-created slots still use the authenticated user's UUID.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    access_grant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("access_grants.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
 class ConnectionProfile(Base):
     __tablename__ = "connection_profiles"
     __table_args__ = (
         CheckConstraint("protocol IN ('wireguard','amneziawg')", name="connection_profiles_protocol_check"),
+        UniqueConstraint("connection_slot_id", "protocol", name="uq_connection_profiles_slot_protocol"),
         Index(
             "uq_connection_profiles_node_tunnel_ip_reserved",
             "node_id",
@@ -159,6 +176,7 @@ class ConnectionProfile(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connection_slot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("connection_slots.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     access_grant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("access_grants.id", ondelete="CASCADE"), nullable=False, index=True)
     protocol: Mapped[str] = mapped_column(String(32), nullable=False)

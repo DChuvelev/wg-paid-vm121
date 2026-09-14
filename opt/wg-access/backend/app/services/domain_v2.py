@@ -15,6 +15,7 @@ from app.models import (
     AccessGrant,
     AccessGrantProtocolLimit,
     AuditEvent,
+    ConnectionSlot,
     ConnectionProfile,
     Peer,
     PeerCredential,
@@ -54,6 +55,14 @@ class ProfileRequestResult:
     profile: ConnectionProfile
     job: ProvisioningJob
     created_job: bool
+
+
+@dataclass(frozen=True)
+class ConfigurationRequestResult:
+    slot: ConnectionSlot
+    profiles: dict[str, ConnectionProfile]
+    jobs: dict[str, ProvisioningJob]
+    created_jobs: dict[str, bool]
 
 
 def utcnow() -> datetime:
@@ -136,17 +145,18 @@ def create_grant_from_plan(
     )
     db.add(grant)
     db.flush()
+    slot_limit = int(plan.default_wireguard_limit)
     db.add_all(
         [
             AccessGrantProtocolLimit(
                 access_grant_id=grant.id,
                 protocol="wireguard",
-                profile_limit=plan.default_wireguard_limit,
+                profile_limit=slot_limit,
             ),
             AccessGrantProtocolLimit(
                 access_grant_id=grant.id,
                 protocol="amneziawg",
-                profile_limit=plan.default_amneziawg_limit,
+                profile_limit=slot_limit,
             ),
         ]
     )
@@ -171,6 +181,44 @@ def protocol_limit(
     if row is None:
         raise ProtocolNotAllowed(f"grant has no {protocol} limit")
     return row
+
+
+def mirrored_configuration_limit(
+    db: Session,
+    *,
+    grant_id: uuid.UUID,
+    for_update: bool = False,
+) -> int:
+    query = select(AccessGrantProtocolLimit).where(
+        AccessGrantProtocolLimit.access_grant_id == grant_id,
+        AccessGrantProtocolLimit.protocol.in_(SUPPORTED_PROTOCOLS),
+    )
+    if for_update:
+        query = query.with_for_update()
+    rows = db.execute(query).scalars().all()
+    by_protocol = {row.protocol: row for row in rows}
+    if set(by_protocol) != set(SUPPORTED_PROTOCOLS):
+        raise ProtocolNotAllowed("grant protocol-limit mirror is incomplete")
+    wg = int(by_protocol[WIREGUARD_RUNTIME_PROTOCOL].profile_limit)
+    awg = int(by_protocol[AMNEZIAWG_RUNTIME_PROTOCOL].profile_limit)
+    if wg != awg:
+        raise DomainV2Error("grant protocol-limit mirror drift")
+    return wg
+
+
+def logical_slot_count(
+    db: Session,
+    *,
+    grant_id: uuid.UUID,
+    user_id: uuid.UUID | None = None,
+) -> int:
+    query = select(func.count(ConnectionSlot.id)).where(
+        ConnectionSlot.access_grant_id == grant_id,
+        ConnectionSlot.disabled_at.is_(None),
+    )
+    if user_id is not None:
+        query = query.where(ConnectionSlot.user_id == user_id)
+    return int(db.execute(query).scalar_one())
 
 
 def _allocator_lock_key(node_id: str, protocol: str) -> int:
@@ -445,6 +493,34 @@ def request_profile_disable(
     return profile, job, created
 
 
+def request_configuration_disable(
+    db: Session,
+    *,
+    slot_id: uuid.UUID,
+) -> list[tuple[ConnectionProfile, ProvisioningJob, bool]]:
+    slot = db.execute(
+        select(ConnectionSlot)
+        .where(ConnectionSlot.id == slot_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if slot is None:
+        raise DomainV2Error("connection slot does not exist")
+    profiles = db.execute(
+        select(ConnectionProfile)
+        .where(ConnectionProfile.connection_slot_id == slot.id)
+        .order_by(ConnectionProfile.protocol.asc())
+        .with_for_update()
+    ).scalars().all()
+    results: list[tuple[ConnectionProfile, ProvisioningJob, bool]] = []
+    for profile in profiles:
+        if profile.status == "disabled":
+            continue
+        results.append(request_profile_disable(db, profile_id=profile.id))
+    if not results:
+        raise DomainV2Error("configuration is already disabled")
+    return results
+
+
 def acknowledge_profile_job(db: Session, *, job: ProvisioningJob) -> None:
     if job.connection_profile_id is None:
         return
@@ -481,6 +557,28 @@ def acknowledge_profile_job(db: Session, *, job: ProvisioningJob) -> None:
         profile.updated_at = now
     else:
         raise DomainV2Error(f"unsupported Domain V2 job action: {job.action}")
+
+    slot = db.execute(
+        select(ConnectionSlot)
+        .where(ConnectionSlot.id == profile.connection_slot_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if slot is None:
+        raise DomainV2Error("connection slot does not exist")
+    db.flush()
+    if job.action == "provision_profile":
+        slot.disabled_at = None
+        slot.updated_at = now
+    else:
+        live_siblings = int(db.execute(
+            select(func.count(ConnectionProfile.id)).where(
+                ConnectionProfile.connection_slot_id == slot.id,
+                ConnectionProfile.status != "disabled",
+            )
+        ).scalar_one())
+        if live_siblings == 0:
+            slot.disabled_at = now
+            slot.updated_at = now
     db.flush()
 
 
@@ -553,6 +651,72 @@ def enqueue_profile_job(
     return job, True
 
 
+def create_configuration_request(
+    db: Session,
+    *,
+    user: User,
+    grant_id: uuid.UUID,
+    node_id: str,
+    label: str | None = None,
+    now: datetime | None = None,
+) -> ConfigurationRequestResult:
+    point = now or utcnow()
+    grant = db.execute(
+        select(AccessGrant)
+        .where(AccessGrant.id == grant_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if grant is None or grant.user_id != user.id or not grant_is_active(grant, now=point):
+        raise GrantInactive("grant is unavailable")
+
+    slot_limit = mirrored_configuration_limit(db, grant_id=grant.id, for_update=True)
+    current_count = logical_slot_count(db, grant_id=grant.id, user_id=user.id)
+    if current_count >= slot_limit:
+        raise ProtocolQuotaExceeded("configuration")
+
+    normalized_label = str(label).strip() if label is not None else ""
+    slot = ConnectionSlot(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        access_grant_id=grant.id,
+        node_id=node_id,
+        label=normalized_label or None,
+        expires_at=grant.valid_until,
+        disabled_at=None,
+    )
+    db.add(slot)
+    db.flush()
+
+    profiles: dict[str, ConnectionProfile] = {}
+    jobs: dict[str, ProvisioningJob] = {}
+    created_jobs: dict[str, bool] = {}
+    for protocol in (WIREGUARD_RUNTIME_PROTOCOL, AMNEZIAWG_RUNTIME_PROTOCOL):
+        profile = ConnectionProfile(
+            id=uuid.uuid4(),
+            connection_slot_id=slot.id,
+            user_id=user.id,
+            access_grant_id=grant.id,
+            protocol=protocol,
+            node_id=node_id,
+            label=slot.label,
+            status="requested",
+            expires_at=grant.valid_until,
+        )
+        db.add(profile)
+        db.flush()
+        job, created = prepare_profile_provisioning(db, profile=profile)
+        profiles[protocol] = profile
+        jobs[protocol] = job
+        created_jobs[protocol] = created
+
+    return ConfigurationRequestResult(
+        slot=slot,
+        profiles=profiles,
+        jobs=jobs,
+        created_jobs=created_jobs,
+    )
+
+
 def create_profile_request(
     db: Session,
     *,
@@ -563,44 +727,24 @@ def create_profile_request(
     label: str | None = None,
     now: datetime | None = None,
 ) -> ProfileRequestResult:
+    # Compatibility surface for the pre-P28G API. A user-visible create is now
+    # one logical configuration slot with both WG and AWG runtime variants; the
+    # legacy caller receives only the variant it requested.
     if protocol not in SUPPORTED_PROTOCOLS:
         raise ProtocolNotAllowed(protocol)
-    point = now or utcnow()
-
-    grant = db.execute(
-        select(AccessGrant)
-        .where(AccessGrant.id == grant_id)
-        .with_for_update()
-    ).scalar_one_or_none()
-    if grant is None or grant.user_id != user.id or not grant_is_active(grant, now=point):
-        raise GrantInactive("grant is unavailable")
-
-    limit_row = protocol_limit(db, grant_id=grant.id, protocol=protocol)
-    current_count = db.execute(
-        select(func.count(ConnectionProfile.id)).where(
-            ConnectionProfile.access_grant_id == grant.id,
-            ConnectionProfile.protocol == protocol,
-            ConnectionProfile.status.in_(PROFILE_QUOTA_STATUSES),
-        )
-    ).scalar_one()
-    if current_count >= limit_row.profile_limit:
-        raise ProtocolQuotaExceeded(protocol)
-
-    profile = ConnectionProfile(
-        id=uuid.uuid4(),
-        user_id=user.id,
-        access_grant_id=grant.id,
-        protocol=protocol,
+    result = create_configuration_request(
+        db,
+        user=user,
+        grant_id=grant_id,
         node_id=node_id,
         label=label,
-        status="requested",
-        expires_at=grant.valid_until,
+        now=now,
     )
-    db.add(profile)
-    db.flush()
-
-    job, created = prepare_profile_provisioning(db, profile=profile)
-    return ProfileRequestResult(profile=profile, job=job, created_job=created)
+    return ProfileRequestResult(
+        profile=result.profiles[protocol],
+        job=result.jobs[protocol],
+        created_job=result.created_jobs[protocol],
+    )
 
 
 def record_audit_event(
