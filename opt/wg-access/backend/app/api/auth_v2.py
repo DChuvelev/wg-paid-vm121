@@ -83,6 +83,7 @@ from app.services.profile_delivery import (
     create_owned_profile,
     list_owned_profiles,
     profile_slot_ordinal,
+    update_owned_configuration_label,
     update_owned_profile_label,
 )
 
@@ -827,6 +828,9 @@ class GrantSummary(BaseModel):
     status: str
     plan_id: UUID | None
     valid_until: datetime | None
+    configuration_limit: int
+    configuration_count: int
+    can_create_configuration: bool
     protocol_limits: list[GrantProtocolLimitSummary]
 
 
@@ -841,13 +845,47 @@ class AccountMetadataUpdateRequest(BaseModel):
     display_name: str | None = Field(max_length=160)
 
 
+def _grant_summary(
+    db: Session,
+    *,
+    grant: AccessGrant,
+    limits: list[AccessGrantProtocolLimit],
+    configuration_count: int,
+) -> GrantSummary:
+    configuration_limit = mirrored_configuration_limit(db, grant_id=grant.id)
+    return GrantSummary(
+        id=grant.id,
+        status=grant.status,
+        plan_id=grant.plan_id,
+        valid_until=grant.valid_until,
+        configuration_limit=configuration_limit,
+        configuration_count=configuration_count,
+        can_create_configuration=(
+            grant_is_active(grant) and configuration_count < configuration_limit
+        ),
+        protocol_limits=[
+            GrantProtocolLimitSummary(
+                protocol=limit.protocol,
+                profile_limit=limit.profile_limit,
+                profile_count=configuration_count,
+                can_create=(
+                    limit.protocol in {"wireguard", "amneziawg"}
+                    and grant_is_active(grant)
+                    and configuration_count < limit.profile_limit
+                ),
+            )
+            for limit in limits
+        ],
+    )
+
+
 def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
     grants = db.execute(
         select(AccessGrant).where(AccessGrant.user_id == user.id).order_by(AccessGrant.created_at.asc())
     ).scalars().all()
 
     limits_by_grant: dict[UUID, list[AccessGrantProtocolLimit]] = {}
-    usage_by_grant_protocol: dict[tuple[UUID, str], int] = {}
+    configuration_count_by_grant: dict[UUID, int] = {}
     grant_ids = [g.id for g in grants]
     if grant_ids:
         limit_rows = db.execute(
@@ -870,10 +908,9 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
             )
             .group_by(ConnectionSlot.access_grant_id)
         ).all()
-        usage_by_grant_protocol = {
-            (grant_id, protocol): int(count)
+        configuration_count_by_grant = {
+            grant_id: int(count)
             for grant_id, count in usage_rows
-            for protocol in ("wireguard", "amneziawg")
         }
 
     return AccountMeResponse(
@@ -881,24 +918,11 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
         email=user.email,
         display_name=user.display_name,
         grants=[
-            GrantSummary(
-                id=g.id,
-                status=g.status,
-                plan_id=g.plan_id,
-                valid_until=g.valid_until,
-                protocol_limits=[
-                    GrantProtocolLimitSummary(
-                        protocol=limit.protocol,
-                        profile_limit=limit.profile_limit,
-                        profile_count=usage_by_grant_protocol.get((g.id, limit.protocol), 0),
-                        can_create=(
-                            limit.protocol in {"wireguard", "amneziawg"}
-                            and grant_is_active(g)
-                            and usage_by_grant_protocol.get((g.id, limit.protocol), 0) < limit.profile_limit
-                        ),
-                    )
-                    for limit in limits_by_grant.get(g.id, [])
-                ],
+            _grant_summary(
+                db,
+                grant=g,
+                limits=limits_by_grant.get(g.id, []),
+                configuration_count=configuration_count_by_grant.get(g.id, 0),
             )
             for g in grants
         ],
@@ -992,6 +1016,45 @@ class ProfileLabelUpdateRequest(BaseModel):
     label: str | None = Field(max_length=160)
 
 
+class ConfigurationVariantSummary(BaseModel):
+    protocol: Literal["wireguard", "amneziawg"]
+    profile_id: UUID
+    status: str
+    tunnel_ip: str | None
+    ready: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConfigurationSummary(BaseModel):
+    configuration_id: UUID
+    ordinal: int
+    access_grant_id: UUID
+    label: str | None
+    created_at: datetime
+    updated_at: datetime
+    variants: list[ConfigurationVariantSummary]
+
+
+class ConfigurationCreateRequest(BaseModel):
+    grant_id: UUID
+    label: str | None = Field(default=None, max_length=160)
+
+
+class ConfigurationVariantMutation(BaseModel):
+    protocol: Literal["wireguard", "amneziawg"]
+    profile: ProfileSummary
+    job_id: UUID
+    job_created: bool
+
+
+class AccountConfigurationCreateResponse(BaseModel):
+    configuration_id: UUID
+    access_grant_id: UUID
+    label: str | None
+    variants: list[ConfigurationVariantMutation]
+
+
 class ProfileConfigDownloadResponse(BaseModel):
     download_url: str
 
@@ -1009,6 +1072,63 @@ def _profile_summary(profile) -> ProfileSummary:
     )
 
 
+def _configuration_summaries(
+    db: Session,
+    *,
+    user: User,
+    include_disabled: bool = False,
+) -> list[ConfigurationSummary]:
+    slots = db.execute(
+        select(ConnectionSlot)
+        .where(ConnectionSlot.user_id == user.id)
+        .order_by(ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
+    ).scalars().all()
+    slot_ids = [slot.id for slot in slots]
+    profiles_by_slot: dict[UUID, dict[str, ConnectionProfile]] = {}
+    if slot_ids:
+        profiles = db.execute(
+            select(ConnectionProfile)
+            .where(ConnectionProfile.connection_slot_id.in_(slot_ids))
+            .order_by(ConnectionProfile.created_at.asc(), ConnectionProfile.id.asc())
+        ).scalars().all()
+        for profile in profiles:
+            profiles_by_slot.setdefault(profile.connection_slot_id, {})[profile.protocol] = profile
+
+    result: list[ConfigurationSummary] = []
+    for ordinal, slot in enumerate(slots, start=1):
+        if slot.disabled_at is not None and not include_disabled:
+            continue
+        variants: list[ConfigurationVariantSummary] = []
+        by_protocol = profiles_by_slot.get(slot.id, {})
+        for protocol in ("wireguard", "amneziawg"):
+            profile = by_protocol.get(protocol)
+            if profile is None:
+                continue
+            variants.append(
+                ConfigurationVariantSummary(
+                    protocol=protocol,
+                    profile_id=profile.id,
+                    status=profile.status,
+                    tunnel_ip=profile.tunnel_ip,
+                    ready=(profile.status == "active" and bool(profile.tunnel_ip)),
+                    created_at=profile.created_at,
+                    updated_at=profile.updated_at,
+                )
+            )
+        result.append(
+            ConfigurationSummary(
+                configuration_id=slot.id,
+                ordinal=ordinal,
+                access_grant_id=slot.access_grant_id,
+                label=slot.label,
+                created_at=slot.created_at,
+                updated_at=slot.updated_at,
+                variants=variants,
+            )
+        )
+    return result
+
+
 @router.get("/account/profiles", response_model=list[ProfileSummary])
 def account_profiles(
     current: tuple[AuthSession, User] = Depends(_current_session),
@@ -1022,6 +1142,105 @@ def account_profiles(
         for row in rows
         if row.protocol == "wireguard" and row.status in PROFILE_QUOTA_STATUSES
     ]
+
+
+@router.get(
+    "/account/profiles/configurations",
+    response_model=list[ConfigurationSummary],
+)
+def account_configurations(
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    return _configuration_summaries(db, user=user)
+
+
+@router.post(
+    "/account/profiles/configurations",
+    response_model=AccountConfigurationCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def account_configuration_create(
+    payload: ConfigurationCreateRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        result = create_owned_configuration(
+            db,
+            user=user,
+            grant_id=payload.grant_id,
+            node_id=settings.wg_default_node_id,
+            label=(str(payload.label).strip() or None) if payload.label is not None else None,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        for profile in result.profiles.values():
+            db.refresh(profile)
+        db.refresh(result.slot)
+        trigger_wg_access_agent_best_effort()
+    except ProfileSurfaceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="configuration cannot be created") from exc
+    return AccountConfigurationCreateResponse(
+        configuration_id=result.slot.id,
+        access_grant_id=result.slot.access_grant_id,
+        label=result.slot.label,
+        variants=[
+            ConfigurationVariantMutation(
+                protocol=protocol,
+                profile=_profile_summary(result.profiles[protocol]),
+                job_id=result.jobs[protocol].id,
+                job_created=result.created_jobs[protocol],
+            )
+            for protocol in ("wireguard", "amneziawg")
+        ],
+    )
+
+
+@router.patch(
+    "/account/profiles/configurations/{configuration_id}",
+    response_model=ConfigurationSummary,
+)
+def account_configuration_update_label(
+    configuration_id: UUID,
+    payload: ProfileLabelUpdateRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        update_owned_configuration_label(
+            db,
+            user=user,
+            configuration_id=configuration_id,
+            label=payload.label,
+            request_id=_request_id(request),
+        )
+        db.commit()
+    except ProfileUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="configuration unavailable") from exc
+    summary = next(
+        (
+            row
+            for row in _configuration_summaries(db, user=user, include_disabled=True)
+            if row.configuration_id == configuration_id
+        ),
+        None,
+    )
+    if summary is None:
+        raise HTTPException(status_code=404, detail="configuration unavailable")
+    return summary
 
 
 @router.post(
@@ -1108,7 +1327,7 @@ def account_profile_config_download_create(
     )
     if owned is None:
         raise HTTPException(status_code=404, detail="profile not found")
-    if owned.protocol != "wireguard" or owned.status != "active" or not owned.tunnel_ip:
+    if owned.protocol not in {"wireguard", "amneziawg"} or owned.status != "active" or not owned.tunnel_ip:
         raise HTTPException(status_code=409, detail="profile is not ready")
 
     try:
@@ -1297,6 +1516,7 @@ class AdminUserSummary(BaseModel):
     invited_by_user_id: UUID | None
     invited_by_label: str | None
     grants: list[GrantSummary]
+    configurations: list[ConfigurationSummary]
     profiles: list[ProfileSummary]
 
 
@@ -1368,13 +1588,6 @@ class AdminConfigurationCreateRequest(BaseModel):
     label: str | None = Field(default=None, max_length=160)
 
 
-class ConfigurationVariantMutation(BaseModel):
-    protocol: str
-    profile: ProfileSummary
-    job_id: UUID
-    job_created: bool
-
-
 class AdminConfigurationCreateResponse(BaseModel):
     configuration_id: UUID
     access_grant_id: UUID
@@ -1441,7 +1654,7 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
     ).scalars().all()
     grant_ids = [grant.id for grant in grants]
     limits_by_grant: dict[UUID, list[AccessGrantProtocolLimit]] = {}
-    usage_by_grant_protocol: dict[tuple[UUID, str], int] = {}
+    configuration_count_by_grant: dict[UUID, int] = {}
 
     if grant_ids:
         limit_rows = db.execute(
@@ -1464,31 +1677,17 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
             )
             .group_by(ConnectionSlot.access_grant_id)
         ).all()
-        usage_by_grant_protocol = {
-            (grant_id, protocol): int(count)
+        configuration_count_by_grant = {
+            grant_id: int(count)
             for grant_id, count in usage_rows
-            for protocol in ("wireguard", "amneziawg")
         }
 
     return [
-        GrantSummary(
-            id=grant.id,
-            status=grant.status,
-            plan_id=grant.plan_id,
-            valid_until=grant.valid_until,
-            protocol_limits=[
-                GrantProtocolLimitSummary(
-                    protocol=limit.protocol,
-                    profile_limit=limit.profile_limit,
-                    profile_count=usage_by_grant_protocol.get((grant.id, limit.protocol), 0),
-                    can_create=(
-                        limit.protocol in {"wireguard", "amneziawg"}
-                        and grant_is_active(grant)
-                        and usage_by_grant_protocol.get((grant.id, limit.protocol), 0) < limit.profile_limit
-                    ),
-                )
-                for limit in limits_by_grant.get(grant.id, [])
-            ],
+        _grant_summary(
+            db,
+            grant=grant,
+            limits=limits_by_grant.get(grant.id, []),
+            configuration_count=configuration_count_by_grant.get(grant.id, 0),
         )
         for grant in grants
     ]
@@ -1963,6 +2162,7 @@ def admin_list_users(
                 invited_by_user_id=invite.created_by_user_id if invite else None,
                 invited_by_label=invite.created_by_label if invite else None,
                 grants=_admin_grant_summaries(db, user=user),
+                configurations=_configuration_summaries(db, user=user),
                 profiles=[_profile_summary(profile) for profile in profiles],
             )
         )

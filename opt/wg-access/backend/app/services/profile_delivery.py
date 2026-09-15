@@ -136,23 +136,25 @@ def create_owned_profile(
     return result
 
 
-def update_owned_profile_label(
+def update_owned_configuration_label(
     db: Session,
     *,
     user,
-    profile_id: uuid.UUID,
+    configuration_id: uuid.UUID,
     label: str | None,
     request_id: str | None,
-) -> ConnectionProfile:
-    profile = _owned_profile(db, user_id=user.id, profile_id=profile_id, for_update=True)
-    normalized = str(label).strip() if label is not None else ""
+) -> ConnectionSlot:
     slot = db.execute(
         select(ConnectionSlot)
-        .where(ConnectionSlot.id == profile.connection_slot_id)
+        .where(
+            ConnectionSlot.id == configuration_id,
+            ConnectionSlot.user_id == user.id,
+        )
         .with_for_update()
     ).scalar_one_or_none()
     if slot is None:
         raise ProfileUnavailable("configuration unavailable")
+    normalized = str(label).strip() if label is not None else ""
     value = normalized or None
     slot.label = value
     slot.updated_at = utcnow()
@@ -175,6 +177,25 @@ def update_owned_profile_label(
         payload={"label_set": value is not None},
     )
     db.flush()
+    return slot
+
+
+def update_owned_profile_label(
+    db: Session,
+    *,
+    user,
+    profile_id: uuid.UUID,
+    label: str | None,
+    request_id: str | None,
+) -> ConnectionProfile:
+    profile = _owned_profile(db, user_id=user.id, profile_id=profile_id, for_update=True)
+    update_owned_configuration_label(
+        db,
+        user=user,
+        configuration_id=profile.connection_slot_id,
+        label=label,
+        request_id=request_id,
+    )
     return profile
 
 
