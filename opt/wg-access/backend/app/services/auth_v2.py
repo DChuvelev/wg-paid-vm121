@@ -664,6 +664,48 @@ def admin_replace_invite_email(
         request_id=req,
     )
 
+
+def admin_reissue_transferable_invite_token(
+    db: Session,
+    *,
+    invite_id: uuid.UUID,
+    request_id: str | None = None,
+) -> tuple[Invite, str]:
+    now = utcnow()
+    invite = db.execute(
+        select(Invite).where(Invite.id == invite_id).with_for_update()
+    ).scalar_one_or_none()
+    if invite is None:
+        raise InviteRejected("invalid invite")
+    _assert_invite_active(db, invite=invite, now=now)
+    live_registration = _live_registration_token(
+        db,
+        invite_id=invite.id,
+        now=now,
+        lock=True,
+    )
+    if (
+        invite.intended_email is not None
+        or invite.pending_email is not None
+        or live_registration is not None
+    ):
+        raise InviteRejected("invite is not transferable")
+
+    req = request_id_or_new(request_id)
+    token = secret_token()
+    invite.token_hash = token.digest
+    record_audit_event(
+        db,
+        event_type="auth.invite.share_token.reissued",
+        actor_kind="admin",
+        object_type="invite",
+        object_id=str(invite.id),
+        request_id=req,
+        payload={},
+    )
+    return invite, token.raw
+
+
 def admin_resend_invite_registration(
     db: Session,
     *,

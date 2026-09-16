@@ -41,6 +41,7 @@ from app.services.auth_v2 import (
     RateLimitExceeded,
     SessionRejected,
     admin_replace_invite_email,
+    admin_reissue_transferable_invite_token,
     admin_resend_invite_registration,
     authenticate_session,
     change_invite_registration_email,
@@ -1498,6 +1499,7 @@ class AdminInviteSummary(BaseModel):
     resend_available_at: datetime | None
     can_resend: bool
     can_change_email: bool
+    can_reissue_share_link: bool
     can_revoke: bool
 
 
@@ -1642,6 +1644,11 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
             and (resend_available_at is None or resend_available_at <= point)
         ),
         can_change_email=(state in {"active", "awaiting_confirmation"}),
+        can_reissue_share_link=(
+            state == "active"
+            and invite.intended_email is None
+            and effective_pending_email is None
+        ),
         can_revoke=(state in {"active", "awaiting_confirmation"}),
     )
 
@@ -1732,6 +1739,11 @@ class AdminInviteLimitUpdateRequest(BaseModel):
     profile_limit: int = Field(ge=0)
 
 
+class AdminInviteShareTokenResponse(BaseModel):
+    invite_id: UUID
+    invite_token: str
+
+
 @router.patch(
     "/admin/invites/{invite_id}/recipient",
     response_model=AdminInviteSummary,
@@ -1759,6 +1771,34 @@ def admin_update_invite_recipient(
         db.rollback()
         raise HTTPException(status_code=409, detail="invite cannot be updated") from exc
     return _admin_invite_summary(db, invite, now=utcnow())
+
+
+@router.post(
+    "/admin/invites/{invite_id}/share-token/reissue",
+    response_model=AdminInviteShareTokenResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_reissue_invite_share_token(
+    invite_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    req = _request_id(request)
+    try:
+        invite, invite_token = admin_reissue_transferable_invite_token(
+            db,
+            invite_id=invite_id,
+            request_id=req,
+        )
+        db.commit()
+        db.refresh(invite)
+    except InviteRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="transferable invite share link cannot be reissued") from exc
+    return AdminInviteShareTokenResponse(
+        invite_id=invite.id,
+        invite_token=invite_token,
+    )
 
 
 @router.patch(
