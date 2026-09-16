@@ -50,6 +50,8 @@ REMOTE_SSH_KEY = env["REMOTE_SSH_KEY"]
 REMOTE_REGISTRY_FILE = env.get("REMOTE_REGISTRY_FILE", "/etc/router-wgpay-peer-state/registry.tsv")
 REMOTE_EGRESS_STATE_FILE = env.get("REMOTE_EGRESS_STATE_FILE", "/var/lib/router-wgpay-egress/state.kv")
 REMOTE_WG_INTERFACE = env.get("REMOTE_WG_INTERFACE", "wg_paid")
+REMOTE_AWG_INTERFACE = env.get("REMOTE_AWG_INTERFACE", "awg_paid")
+REMOTE_AWG_CLI = env.get("REMOTE_AWG_CLI", "awg")
 SAMPLE_INTERVAL_SECONDS = float(env.get("RUNTIME_TELEMETRY_INTERVAL_SECONDS", "5"))
 if SAMPLE_INTERVAL_SECONDS <= 0 or SAMPLE_INTERVAL_SECONDS > 60:
     raise RuntimeError("invalid RUNTIME_TELEMETRY_INTERVAL_SECONDS")
@@ -79,7 +81,9 @@ def http_post_json(path, payload):
 def remote_snapshot_text():
     registry = shlex.quote(REMOTE_REGISTRY_FILE)
     state = shlex.quote(REMOTE_EGRESS_STATE_FILE)
-    interface = shlex.quote(REMOTE_WG_INTERFACE)
+    wg_interface = shlex.quote(REMOTE_WG_INTERFACE)
+    awg_interface = shlex.quote(REMOTE_AWG_INTERFACE)
+    awg_cli = shlex.quote(REMOTE_AWG_CLI)
     remote_script = f"""set -eu
 printf '%s\\n' '__REGISTRY_BEGIN__'
 cat {registry}
@@ -88,8 +92,11 @@ printf '%s\\n' '__STATE_BEGIN__'
 cat {state}
 printf '%s\\n' '__STATE_END__'
 printf '%s\\n' '__WG_BEGIN__'
-wg show {interface} dump | awk 'NR > 1 {{print $1 "\\t" $5 "\\t" $6 "\\t" $7}}'
+wg show {wg_interface} dump | awk 'NR > 1 {{print $1 "\\t" $5 "\\t" $6 "\\t" $7}}'
 printf '%s\\n' '__WG_END__'
+printf '%s\\n' '__AWG_BEGIN__'
+{awg_cli} show {awg_interface} dump | awk 'NR > 1 {{print $1 "\\t" $5 "\\t" $6 "\\t" $7}}'
+printf '%s\\n' '__AWG_END__'
 """
     cmd = [
         "ssh",
@@ -149,7 +156,11 @@ def parse_registry(lines):
             "created_epoch": parts[8],
             "updated_epoch": parts[9],
         }
-        if row["protocol"] == "wireguard" and row["interface"] == REMOTE_WG_INTERFACE:
+        expected_interface = {
+            "wireguard": REMOTE_WG_INTERFACE,
+            "amneziawg": REMOTE_AWG_INTERFACE,
+        }.get(row["protocol"])
+        if expected_interface is not None and row["interface"] == expected_interface:
             rows.append(row)
     return rows
 
@@ -204,7 +215,10 @@ def nonnegative_int(value):
 def build_payload(text, previous, previous_sample_monotonic, now_monotonic):
     registry = parse_registry(framed_section(text, "REGISTRY"))
     state = parse_state(framed_section(text, "STATE"))
-    wg = parse_wg(framed_section(text, "WG"))
+    runtime_by_protocol = {
+        "wireguard": parse_wg(framed_section(text, "WG")),
+        "amneziawg": parse_wg(framed_section(text, "AWG")),
+    }
     elapsed = SAMPLE_INTERVAL_SECONDS
     if previous_sample_monotonic is not None:
         elapsed = max(0.001, now_monotonic - previous_sample_monotonic)
@@ -216,13 +230,17 @@ def build_payload(text, previous, previous_sample_monotonic, now_monotonic):
         if selector not in {"cs1", "cs2", "cs3", "cs4", "cs5"}:
             continue
         activity = state.get(reg["tunnel_ip"], {})
-        runtime = wg.get(reg["public_key"], {})
+        runtime = runtime_by_protocol[reg["protocol"]].get(reg["public_key"], {})
         rx = nonnegative_int(runtime.get("rx_bytes"))
         tx = nonnegative_int(runtime.get("tx_bytes"))
         previous_row = previous.get(reg["profile_id"])
         rx_rate = 0.0
         tx_rate = 0.0
-        if previous_row and previous_row.get("public_key") == reg["public_key"]:
+        if (
+            previous_row
+            and previous_row.get("protocol") == reg["protocol"]
+            and previous_row.get("public_key") == reg["public_key"]
+        ):
             old_rx = nonnegative_int(previous_row.get("rx_bytes"))
             old_tx = nonnegative_int(previous_row.get("tx_bytes"))
             if rx >= old_rx and tx >= old_tx:
@@ -231,6 +249,7 @@ def build_payload(text, previous, previous_sample_monotonic, now_monotonic):
 
         rows.append({
             "profile_id": reg["profile_id"],
+            "protocol": reg["protocol"],
             "tunnel_ip": reg["tunnel_ip"],
             "selector": selector,
             "active_now": true_value(activity.get("active_now")),
@@ -244,6 +263,7 @@ def build_payload(text, previous, previous_sample_monotonic, now_monotonic):
             "tx_bytes_per_second": tx_rate,
         })
         next_previous[reg["profile_id"]] = {
+            "protocol": reg["protocol"],
             "public_key": reg["public_key"],
             "rx_bytes": rx,
             "tx_bytes": tx,

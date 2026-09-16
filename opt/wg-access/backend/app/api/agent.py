@@ -242,6 +242,7 @@ def fail_job(
 
 class RuntimeSnapshotRowRequest(BaseModel):
     profile_id: UUID
+    protocol: Literal["wireguard", "amneziawg"]
     tunnel_ip: str
     selector: str = Field(pattern=r"^cs[1-5]$")
     active_now: bool

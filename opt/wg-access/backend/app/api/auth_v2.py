@@ -1526,7 +1526,11 @@ class AdminRuntimeConnectionRow(BaseModel):
     user_id: UUID
     email: str
     display_name: str | None
+    configuration_id: UUID
+    configuration_ordinal: int
+    configuration_label: str | None
     profile_id: UUID
+    protocol: Literal["wireguard", "amneziawg"]
     profile_label: str | None
     tunnel_ip: str
     selector: str
@@ -2064,6 +2068,18 @@ def admin_runtime_connections(db: Session = Depends(get_db)):
         user.id: user
         for user in db.execute(select(User).where(User.id.in_(user_ids))).scalars().all()
     } if user_ids else {}
+    slots = db.execute(
+        select(ConnectionSlot)
+        .where(ConnectionSlot.user_id.in_(user_ids))
+        .order_by(ConnectionSlot.user_id.asc(), ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
+    ).scalars().all() if user_ids else []
+    slots_by_id = {slot.id: slot for slot in slots}
+    slot_ordinals: dict[UUID, int] = {}
+    ordinal_by_user: dict[UUID, int] = {}
+    for slot in slots:
+        ordinal = ordinal_by_user.get(slot.user_id, 0) + 1
+        ordinal_by_user[slot.user_id] = ordinal
+        slot_ordinals[slot.id] = ordinal
 
     rows: list[AdminRuntimeConnectionRow] = []
     unmatched = 0
@@ -2073,14 +2089,25 @@ def admin_runtime_connections(db: Session = Depends(get_db)):
             unmatched += 1
             continue
         user = users.get(profile.user_id)
-        if user is None:
+        slot = slots_by_id.get(profile.connection_slot_id)
+        runtime_protocol = str(runtime.get("protocol") or "")
+        if (
+            user is None
+            or slot is None
+            or slot.user_id != user.id
+            or runtime_protocol != profile.protocol
+        ):
             unmatched += 1
             continue
         rows.append(AdminRuntimeConnectionRow(
             user_id=user.id,
             email=user.email,
             display_name=user.display_name,
+            configuration_id=slot.id,
+            configuration_ordinal=slot_ordinals[slot.id],
+            configuration_label=slot.label,
             profile_id=profile.id,
+            protocol=profile.protocol,
             profile_label=profile.label,
             tunnel_ip=str(runtime["tunnel_ip"]),
             selector=str(runtime["selector"]),
