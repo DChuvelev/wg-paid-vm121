@@ -19,6 +19,14 @@ from app.models import (
     Plan,
     User,
 )
+from app.services.commercial import (
+    CommercialRegistrationRejected,
+    ReferralNotEligible,
+    active_offer_for_plan,
+    commercial_referral_invite_is_effective,
+    create_commercial_trial_registration,
+    require_referral_eligible,
+)
 from app.services.domain_v2 import (
     InvalidIdentity,
     create_grant_from_plan,
@@ -126,30 +134,65 @@ def issue_invite(
     plan = db.get(Plan, plan_id)
     if plan is None or not plan.active:
         raise AuthV2Error("plan is unavailable")
-    wg_limit = plan.default_wireguard_limit if wireguard_profile_limit is None else int(wireguard_profile_limit)
-    if wg_limit < 0:
-        raise AuthV2Error("wireguard profile limit is invalid")
 
     issuer_kind = str(created_by_kind or "").strip().casefold()
     if issuer_kind not in {"admin", "user", "system"}:
         raise AuthV2Error("invite issuer kind is invalid")
     issuer_user_id = created_by_user_id
+    now = utcnow()
+    offer = active_offer_for_plan(db, plan_id=plan.id)
+
     if issuer_kind == "user":
         if issuer_user_id is None:
             raise AuthV2Error("invite issuer user is required")
         issuer = db.get(User, issuer_user_id)
         if issuer is None:
             raise AuthV2Error("invite issuer user is unavailable")
+        if offer is None:
+            raise AuthV2Error("user referrals require a commercial plan")
+        if normalized is not None:
+            raise AuthV2Error("user referral invite must remain transferable")
+        try:
+            eligibility = require_referral_eligible(
+                db,
+                user_id=issuer.id,
+                now=now,
+                lock_account=True,
+            )
+        except ReferralNotEligible as exc:
+            raise AuthV2Error("referral privilege is unavailable") from exc
+        if eligibility.offer.id != offer.id:
+            raise AuthV2Error("user commercial offer mismatch")
+        if int(plan.default_wireguard_limit) != int(offer.base_slot_quantity) or int(plan.default_amneziawg_limit) != int(offer.base_slot_quantity):
+            raise AuthV2Error("commercial plan configuration limit drift")
+        if wireguard_profile_limit is not None and int(wireguard_profile_limit) != int(offer.base_slot_quantity):
+            raise AuthV2Error("commercial referral configuration limit is fixed")
+        wg_limit = int(offer.base_slot_quantity)
+        active_count = int(db.execute(
+            select(func.count(Invite.id)).where(
+                Invite.created_by_kind == "user",
+                Invite.created_by_user_id == issuer.id,
+                Invite.revoked_at.is_(None),
+                Invite.used_count < Invite.max_uses,
+                (Invite.expires_at.is_(None) | (Invite.expires_at > now)),
+            )
+        ).scalar_one())
+        if active_count >= int(offer.active_referral_invite_limit):
+            raise AuthV2Error("active referral invite limit reached")
         issuer_label = normalize_email(issuer.email)
     else:
         if issuer_user_id is not None:
             raise AuthV2Error("non-user invite issuer cannot have a user id")
+        if offer is not None:
+            raise AuthV2Error("commercial referral plans are user-invite only")
+        wg_limit = plan.default_wireguard_limit if wireguard_profile_limit is None else int(wireguard_profile_limit)
+        if wg_limit < 0:
+            raise AuthV2Error("wireguard profile limit is invalid")
         issuer_label = str(created_by_label or ("Admin" if issuer_kind == "admin" else "System")).strip()
         if not issuer_label or len(issuer_label) > 320:
             raise AuthV2Error("invite issuer label is invalid")
 
     tok = secret_token()
-    now = utcnow()
     row = Invite(
         id=uuid.uuid4(),
         token_hash=tok.digest,
@@ -183,6 +226,7 @@ def issue_invite(
             "wireguard_profile_limit": wg_limit,
             "max_uses": 1,
             "created_by_kind": issuer_kind,
+            "commercial_referral": offer is not None,
         },
     )
     return InviteIssueResult(invite=row, token=tok.raw)
@@ -215,6 +259,14 @@ def _assert_invite_active(db: Session, *, invite: Invite, now: datetime) -> Plan
         raise InviteRejected("invalid invite")
     plan = db.get(Plan, invite.plan_id)
     if plan is None or not plan.active:
+        raise InviteRejected("invalid invite")
+    offer = active_offer_for_plan(db, plan_id=plan.id)
+    if offer is not None:
+        if not commercial_referral_invite_is_effective(db, invite=invite, now=now):
+            raise InviteRejected("invalid invite")
+    elif invite.created_by_kind == "user":
+        # User-generated invites are commercial referrals only. Do not let a
+        # malformed/stale user invite escape into the pilot/admin plan path.
         raise InviteRejected("invalid invite")
     return plan
 
@@ -600,6 +652,8 @@ def admin_replace_invite_email(
     ).scalar_one_or_none()
     if invite is None:
         raise InviteRejected("invalid invite")
+    if invite.created_by_kind == "user":
+        raise InviteRejected("user referral invite is not admin-mutable")
     _assert_invite_active(db, invite=invite, now=now)
     req = request_id_or_new(request_id)
     normalized = normalize_email(email) if email else None
@@ -677,6 +731,8 @@ def admin_reissue_transferable_invite_token(
     ).scalar_one_or_none()
     if invite is None:
         raise InviteRejected("invalid invite")
+    if invite.created_by_kind == "user":
+        raise InviteRejected("user referral invite is not admin-mutable")
     _assert_invite_active(db, invite=invite, now=now)
     live_registration = _live_registration_token(
         db,
@@ -706,6 +762,80 @@ def admin_reissue_transferable_invite_token(
     return invite, token.raw
 
 
+
+def user_reissue_referral_invite_token(
+    db: Session,
+    *,
+    user: User,
+    invite_id: uuid.UUID,
+    request_id: str | None = None,
+) -> tuple[Invite, str]:
+    now = utcnow()
+    require_referral_eligible(db, user_id=user.id, now=now, lock_account=True)
+    invite = db.execute(
+        select(Invite).where(Invite.id == invite_id).with_for_update()
+    ).scalar_one_or_none()
+    if invite is None or invite.created_by_kind != "user" or invite.created_by_user_id != user.id:
+        raise InviteRejected("invalid referral invite")
+    _assert_invite_active(db, invite=invite, now=now)
+    live_registration = _live_registration_token(db, invite_id=invite.id, now=now, lock=True)
+    if invite.intended_email is not None or invite.pending_email is not None or live_registration is not None:
+        raise InviteRejected("referral invite is not transferable")
+    token = secret_token()
+    invite.token_hash = token.digest
+    record_audit_event(
+        db,
+        event_type="auth.referral.share_token.reissued",
+        actor_kind="user",
+        actor_user_id=user.id,
+        object_type="invite",
+        object_id=str(invite.id),
+        request_id=request_id_or_new(request_id),
+        payload={},
+    )
+    return invite, token.raw
+
+
+def user_revoke_referral_invite(
+    db: Session,
+    *,
+    user: User,
+    invite_id: uuid.UUID,
+    request_id: str | None = None,
+) -> Invite:
+    now = utcnow()
+    invite = db.execute(
+        select(Invite).where(Invite.id == invite_id).with_for_update()
+    ).scalar_one_or_none()
+    if invite is None or invite.created_by_kind != "user" or invite.created_by_user_id != user.id:
+        raise InviteRejected("invalid referral invite")
+    if invite.used_count >= invite.max_uses:
+        raise InviteRejected("used referral invite cannot be revoked")
+    if invite.expires_at is not None and invite.expires_at <= now:
+        raise InviteRejected("expired referral invite cannot be revoked")
+    if invite.revoked_at is None:
+        req = request_id_or_new(request_id)
+        invalidate_registration_tokens(
+            db,
+            invite=invite,
+            now=now,
+            request_id=req,
+            reason="user_referral_revoke",
+        )
+        invite.revoked_at = now
+        record_audit_event(
+            db,
+            event_type="auth.referral.revoked",
+            actor_kind="user",
+            actor_user_id=user.id,
+            object_type="invite",
+            object_id=str(invite.id),
+            request_id=req,
+            payload={"used_count": invite.used_count, "max_uses": invite.max_uses},
+        )
+    return invite
+
+
 def admin_resend_invite_registration(
     db: Session,
     *,
@@ -722,6 +852,8 @@ def admin_resend_invite_registration(
     ).scalar_one_or_none()
     if invite is None:
         raise InviteRejected("invalid invite")
+    if invite.created_by_kind == "user":
+        raise InviteRejected("user referral invite is not admin-mutable")
     _assert_invite_active(db, invite=invite, now=now)
     req = request_id_or_new(request_id)
     latest = _latest_registration_token(db, invite_id=invite.id, lock=True)
@@ -883,12 +1015,12 @@ def consume_magic_link(
         invite = db.execute(
             select(Invite).where(Invite.id == row.invite_id).with_for_update()
         ).scalar_one_or_none()
-        if invite is None or invite.revoked_at is not None:
+        if invite is None:
             raise MagicLinkRejected("invalid magic link")
-        if invite.expires_at is not None and invite.expires_at <= now:
-            raise MagicLinkRejected("invalid magic link")
-        if invite.used_count >= invite.max_uses:
-            raise MagicLinkRejected("invalid magic link")
+        try:
+            _assert_invite_active(db, invite=invite, now=now)
+        except InviteRejected as exc:
+            raise MagicLinkRejected("invalid magic link") from exc
         normalized = normalize_email(row.email)
         if invite.intended_email and normalize_email(invite.intended_email) != normalized:
             raise MagicLinkRejected("invalid magic link")
@@ -913,47 +1045,65 @@ def consume_magic_link(
             plan = db.get(Plan, invite.plan_id)
             if plan is None or not plan.active:
                 raise MagicLinkRejected("invalid magic link")
-            grant = create_grant_from_plan(
-                db,
-                user=user,
-                plan=plan,
-                source_type="invite",
-                source_ref=str(invite.id),
-                valid_from=now,
-                valid_until=None,
-            )
-
-            slot_limit = (
-                int(invite.wireguard_profile_limit)
-                if invite.wireguard_profile_limit is not None
-                else int(plan.default_wireguard_limit)
-            )
-            for protocol_name in ("wireguard", "amneziawg"):
-                protocol_limit(db, grant_id=grant.id, protocol=protocol_name).profile_limit = slot_limit
-            db.flush()
-            effective_wg_limit = slot_limit
-            if slot_limit > 0:
-                profile_result = create_profile_request(
+            offer = active_offer_for_plan(db, plan_id=plan.id)
+            if offer is not None:
+                try:
+                    trial = create_commercial_trial_registration(
+                        db,
+                        user=user,
+                        invite=invite,
+                        wg_node_id=wg_node_id,
+                        now=now,
+                        request_id=req,
+                    )
+                except CommercialRegistrationRejected as exc:
+                    raise MagicLinkRejected("invalid magic link") from exc
+                grant = trial.grant
+                effective_wg_limit = int(offer.base_slot_quantity)
+                if any(trial.configuration.created_jobs.values()):
+                    agent_wakeup_needed = True
+            else:
+                grant = create_grant_from_plan(
                     db,
                     user=user,
-                    grant_id=grant.id,
-                    protocol="wireguard",
-                    node_id=wg_node_id,
-                    label=None,
-                    now=now,
+                    plan=plan,
+                    source_type="invite",
+                    source_ref=str(invite.id),
+                    valid_from=now,
+                    valid_until=None,
                 )
-                if profile_result.created_job:
-                    agent_wakeup_needed = True
-                record_audit_event(
-                    db,
-                    event_type="profile.requested",
-                    actor_kind="system",
-                    actor_user_id=user.id,
-                    object_type="connection_profile",
-                    object_id=str(profile_result.profile.id),
-                    request_id=req,
-                    payload={"protocol": "wireguard", "paired_protocol": "amneziawg", "reason": "initial_registration"},
+
+                slot_limit = (
+                    int(invite.wireguard_profile_limit)
+                    if invite.wireguard_profile_limit is not None
+                    else int(plan.default_wireguard_limit)
                 )
+                for protocol_name in ("wireguard", "amneziawg"):
+                    protocol_limit(db, grant_id=grant.id, protocol=protocol_name).profile_limit = slot_limit
+                db.flush()
+                effective_wg_limit = slot_limit
+                if slot_limit > 0:
+                    profile_result = create_profile_request(
+                        db,
+                        user=user,
+                        grant_id=grant.id,
+                        protocol="wireguard",
+                        node_id=wg_node_id,
+                        label=None,
+                        now=now,
+                    )
+                    if profile_result.created_job:
+                        agent_wakeup_needed = True
+                    record_audit_event(
+                        db,
+                        event_type="profile.requested",
+                        actor_kind="system",
+                        actor_user_id=user.id,
+                        object_type="connection_profile",
+                        object_id=str(profile_result.profile.id),
+                        request_id=req,
+                        payload={"protocol": "wireguard", "paired_protocol": "amneziawg", "reason": "initial_registration"},
+                    )
 
         row.user_id = user.id
         row.consumed_at = now

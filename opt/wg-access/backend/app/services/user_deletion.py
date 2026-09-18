@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 from app.models import (
     AccessGrant,
     AuthSession,
+    BillingAccount,
     ConnectionProfile,
+    Invite,
     MagicLinkToken,
     Order,
     Peer,
@@ -65,6 +67,45 @@ def _profiles_not_fully_disabled(db: Session, *, user_id: UUID) -> list[Connecti
     )
 
 
+def _commercial_account_for_user(db: Session, *, user_id: UUID) -> BillingAccount | None:
+    return db.execute(
+        select(BillingAccount).where(BillingAccount.user_id == user_id).with_for_update()
+    ).scalar_one_or_none()
+
+
+def _expire_commercial_access_for_deletion(db: Session, *, user_id: UUID, now) -> None:
+    account = _commercial_account_for_user(db, user_id=user_id)
+    if account is not None:
+        account.status = "expired"
+        account.cancel_at_period_end = True
+        account.next_charge_at = None
+        account.grace_until = None
+        account.updated_at = now
+
+    referrals = db.execute(
+        select(Invite)
+        .where(
+            Invite.created_by_kind == "user",
+            Invite.created_by_user_id == user_id,
+            Invite.revoked_at.is_(None),
+        )
+        .with_for_update()
+    ).scalars().all()
+    for invite in referrals:
+        invite.revoked_at = now
+
+
+def _delete_commercial_account_before_user(db: Session, *, user_id: UUID) -> None:
+    # P29C has no live payment-provider integration. Trial/current commercial
+    # account rows are operational user data; billing_payments cascade through
+    # the new billing_accounts -> billing_payments FK. P29D must revisit fiscal
+    # retention before enabling real provider payments.
+    account = _commercial_account_for_user(db, user_id=user_id)
+    if account is not None:
+        db.delete(account)
+        db.flush()
+
+
 def finalize_user_deletion_if_ready(
     db: Session,
     *,
@@ -80,6 +121,8 @@ def finalize_user_deletion_if_ready(
         return False
     if _legacy_dependency_count(db, user_id=user.id):
         return False
+
+    _delete_commercial_account_before_user(db, user_id=user.id)
 
     record_audit_event(
         db,
@@ -109,6 +152,8 @@ def request_admin_user_deletion(
     first_request = user.deletion_requested_at is None
     if first_request:
         user.deletion_requested_at = now
+
+    _expire_commercial_access_for_deletion(db, user_id=user.id, now=now)
 
     sessions = db.execute(
         select(AuthSession).where(AuthSession.user_id == user.id).with_for_update()

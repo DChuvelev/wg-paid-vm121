@@ -24,6 +24,7 @@ from app.models import (
     AccessGrant,
     AccessGrantProtocolLimit,
     AuthSession,
+    BillingOffer,
     ConnectionProfile,
     ConnectionSlot,
     Invite,
@@ -57,6 +58,13 @@ from app.services.auth_v2 import (
     request_id_or_new,
     resend_invite_registration,
     revoke_session,
+    user_reissue_referral_invite_token,
+    user_revoke_referral_invite,
+)
+from app.services.commercial import (
+    ReferralNotEligible,
+    commercial_referral_invite_is_effective,
+    require_referral_eligible,
 )
 from app.services.domain_v2 import (
     DomainV2Error,
@@ -566,6 +574,9 @@ class InviteInspectResponse(BaseModel):
 
 def _public_invite_inspect(db: Session, *, invite: Invite, now: datetime) -> InviteInspectResponse:
     state = _invite_lifecycle_state(invite, now=now)
+    if state in {"active", "awaiting_confirmation"} and invite.created_by_kind == "user":
+        if not commercial_referral_invite_is_effective(db, invite=invite, now=now):
+            state = "revoked"
     latest = latest_registration_token(db, invite_id=invite.id)
     live = (
         latest
@@ -965,6 +976,161 @@ def account_me_update(
     db.commit()
     db.refresh(user)
     return _account_me_response(db, user=user)
+
+
+class ReferralInviteSummary(BaseModel):
+    invite_id: UUID
+    state: Literal["active", "awaiting_confirmation", "used", "revoked", "expired"]
+    created_at: datetime
+    expires_at: datetime | None
+    used_count: int
+    max_uses: int
+    can_reissue_share_link: bool
+
+
+class ReferralInviteCreateResponse(BaseModel):
+    invite: ReferralInviteSummary
+    invite_token: str
+
+
+def _referral_invite_summary(db: Session, invite: Invite, *, now: datetime) -> ReferralInviteSummary:
+    state = _invite_lifecycle_state(invite, now=now)
+    effective = commercial_referral_invite_is_effective(db, invite=invite, now=now)
+    if state in {"active", "awaiting_confirmation"} and not effective:
+        state = "revoked"
+    live_registration = latest_registration_token(db, invite_id=invite.id)
+    can_reissue = (
+        state == "active"
+        and effective
+        and invite.intended_email is None
+        and invite.pending_email is None
+        and (
+            live_registration is None
+            or live_registration.consumed_at is not None
+            or live_registration.expires_at <= now
+        )
+    )
+    return ReferralInviteSummary(
+        invite_id=invite.id,
+        state=state,
+        created_at=invite.created_at,
+        expires_at=invite.expires_at,
+        used_count=invite.used_count,
+        max_uses=invite.max_uses,
+        can_reissue_share_link=can_reissue,
+    )
+
+
+@router.get("/account/referrals", response_model=list[ReferralInviteSummary])
+def account_referrals(
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    rows = db.execute(
+        select(Invite)
+        .where(Invite.created_by_kind == "user", Invite.created_by_user_id == user.id)
+        .order_by(Invite.created_at.desc(), Invite.id.desc())
+    ).scalars().all()
+    point = utcnow()
+    return [_referral_invite_summary(db, row, now=point) for row in rows]
+
+
+@router.post(
+    "/account/referrals",
+    response_model=ReferralInviteCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def account_referral_create(
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    req = _request_id(request)
+    try:
+        eligibility = require_referral_eligible(db, user_id=user.id, now=utcnow(), lock_account=True)
+        result = issue_invite(
+            db,
+            intended_email=None,
+            ttl_seconds=settings.auth_invite_ttl_seconds,
+            plan_id=eligibility.offer.plan_id,
+            wireguard_profile_limit=eligibility.offer.base_slot_quantity,
+            created_by_kind="user",
+            created_by_user_id=user.id,
+            request_id=req,
+        )
+        db.commit()
+        db.refresh(result.invite)
+    except (AuthV2Error, ReferralNotEligible) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="referral invite cannot be issued") from exc
+    return ReferralInviteCreateResponse(
+        invite=_referral_invite_summary(db, result.invite, now=utcnow()),
+        invite_token=result.token,
+    )
+
+
+@router.post(
+    "/account/referrals/{invite_id}/share-token/reissue",
+    response_model=ReferralInviteCreateResponse,
+)
+def account_referral_reissue(
+    invite_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        invite, token = user_reissue_referral_invite_token(
+            db,
+            user=user,
+            invite_id=invite_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(invite)
+    except (InviteRejected, ReferralNotEligible) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="referral share link cannot be reissued") from exc
+    return ReferralInviteCreateResponse(
+        invite=_referral_invite_summary(db, invite, now=utcnow()),
+        invite_token=token,
+    )
+
+
+@router.post(
+    "/account/referrals/{invite_id}/revoke",
+    response_model=ReferralInviteSummary,
+)
+def account_referral_revoke(
+    invite_id: UUID,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        invite = user_revoke_referral_invite(
+            db,
+            user=user,
+            invite_id=invite_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(invite)
+    except InviteRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="referral invite cannot be revoked") from exc
+    return _referral_invite_summary(db, invite, now=utcnow())
 
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -1710,7 +1876,12 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
     dependencies=[Depends(_require_admin)],
 )
 def admin_list_plans(db: Session = Depends(get_db)):
-    rows = db.execute(select(Plan).order_by(Plan.created_at.asc())).scalars().all()
+    commercial_plan_ids = select(BillingOffer.plan_id)
+    rows = db.execute(
+        select(Plan)
+        .where(Plan.id.not_in(commercial_plan_ids))
+        .order_by(Plan.created_at.asc())
+    ).scalars().all()
     return [
         AdminPlanSummary(
             id=row.id,
@@ -1821,6 +1992,9 @@ def admin_update_invite_wireguard_limit(
     ).scalar_one_or_none()
     if invite is None:
         raise HTTPException(status_code=404, detail="invite not found")
+    if invite.created_by_kind == "user":
+        db.rollback()
+        raise HTTPException(status_code=409, detail="user referral invite is not admin-mutable")
     now = utcnow()
     if _invite_lifecycle_state(invite, now=now) not in {"active", "awaiting_confirmation"}:
         db.rollback()

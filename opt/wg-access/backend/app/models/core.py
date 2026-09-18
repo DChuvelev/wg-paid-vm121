@@ -224,6 +224,98 @@ class AuditEvent(Base):
     payload_json: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
 
 
+class BillingOffer(Base):
+    __tablename__ = "billing_offers"
+    __table_args__ = (
+        CheckConstraint("currency = 'RUB'", name="billing_offers_currency_rub"),
+        CheckConstraint("base_slot_quantity >= 1", name="billing_offers_base_slot_quantity_positive"),
+        CheckConstraint("base_monthly_kopeks >= 0", name="billing_offers_base_monthly_kopeks_nonnegative"),
+        CheckConstraint("extra_slot_monthly_kopeks >= 0", name="billing_offers_extra_slot_monthly_kopeks_nonnegative"),
+        CheckConstraint("trial_days >= 1", name="billing_offers_trial_days_positive"),
+        CheckConstraint("max_slot_quantity >= base_slot_quantity", name="billing_offers_max_slot_quantity_valid"),
+        CheckConstraint("active_referral_invite_limit >= 0", name="billing_offers_referral_limit_nonnegative"),
+        UniqueConstraint("plan_id", name="uq_billing_offers_plan_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), default="RUB", nullable=False)
+    base_slot_quantity: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    base_monthly_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    extra_slot_monthly_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    trial_days: Mapped[int] = mapped_column(Integer, default=7, nullable=False)
+    max_slot_quantity: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    active_referral_invite_limit: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    # Live plans.id has historical referenced-key drift. Do not add an ORM FK
+    # that the accepted production schema cannot truthfully enforce; P29C links
+    # the deterministic internal commercial plan at the service boundary.
+    plan_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class BillingAccount(Base):
+    __tablename__ = "billing_accounts"
+    __table_args__ = (
+        CheckConstraint("status IN ('trial','active_paid','past_due','expired')", name="billing_accounts_status_check"),
+        CheckConstraint("billing_mode IN ('manual','recurring')", name="billing_accounts_mode_check"),
+        CheckConstraint("slot_quantity >= 1", name="billing_accounts_slot_quantity_positive"),
+        CheckConstraint("pending_slot_quantity IS NULL OR pending_slot_quantity >= 1", name="billing_accounts_pending_slot_quantity_positive"),
+        CheckConstraint("current_period_end > current_period_start", name="billing_accounts_period_positive"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Legacy users.id is a service-validated soft reference because the accepted
+    # live table is not a valid new FK target. access_grants.id is a proven FK
+    # target and remains database-enforced.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True, index=True)
+    access_grant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("access_grants.id"), nullable=False, unique=True, index=True)
+    offer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("billing_offers.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    billing_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    slot_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    pending_slot_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    grace_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payment_method_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    next_charge_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class BillingPayment(Base):
+    __tablename__ = "billing_payments"
+    __table_args__ = (
+        CheckConstraint("provider = 'yookassa'", name="billing_payments_provider_yookassa"),
+        CheckConstraint("kind IN ('initial','manual_renewal','auto_renewal','upgrade')", name="billing_payments_kind_check"),
+        CheckConstraint("status IN ('created','pending','succeeded','canceled')", name="billing_payments_status_check"),
+        CheckConstraint("amount_kopeks >= 0", name="billing_payments_amount_nonnegative"),
+        CheckConstraint("currency = 'RUB'", name="billing_payments_currency_rub"),
+        CheckConstraint("quantity_before >= 1", name="billing_payments_quantity_before_positive"),
+        CheckConstraint("quantity_after >= 1", name="billing_payments_quantity_after_positive"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    billing_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("billing_accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(32), default="yookassa", nullable=False)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    idempotence_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    provider_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    amount_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), default="RUB", nullable=False)
+    quantity_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    quantity_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    target_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    succeeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 # Legacy compatibility tables remain mapped while the existing agent/read APIs
 # are retired incrementally. They are not Domain V2 entitlement authority.
 class InviteCode(Base):
