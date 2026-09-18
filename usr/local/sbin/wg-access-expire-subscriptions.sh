@@ -46,7 +46,14 @@ from sqlalchemy import select
 
 from app.agent_trigger import trigger_wg_access_agent_best_effort
 from app.db.session import SessionLocal
-from app.models import AccessGrant, ConnectionProfile, ConnectionSlot, ProvisioningJob
+from app.models import (
+    AccessGrant,
+    BillingAccount,
+    ConnectionProfile,
+    ConnectionSlot,
+    Invite,
+    ProvisioningJob,
+)
 from app.services.domain_v2 import (
     DomainV2Error,
     record_audit_event,
@@ -123,6 +130,39 @@ def _terminalize_superseded_provision_jobs(db, *, profiles, now):
         job.last_error = "superseded by access-grant expiry"
     db.flush()
     return len(jobs)
+
+
+def _expire_commercial_state(db, *, grant, now):
+    account = db.execute(
+        select(BillingAccount)
+        .where(BillingAccount.access_grant_id == grant.id)
+        .with_for_update()
+    ).scalar_one_or_none()
+
+    if account is None:
+        return {"account_expired": 0, "referrals_revoked": 0}
+
+    active_referrals = db.execute(
+        select(Invite)
+        .where(Invite.created_by_kind == "user")
+        .where(Invite.created_by_user_id == account.user_id)
+        .where(Invite.revoked_at.is_(None))
+        .where(Invite.used_count < Invite.max_uses)
+        .where((Invite.expires_at.is_(None)) | (Invite.expires_at > now))
+        .order_by(Invite.created_at.asc(), Invite.id.asc())
+        .with_for_update()
+    ).scalars().all()
+
+    account.status = "expired"
+    account.updated_at = now
+    for invite in active_referrals:
+        invite.revoked_at = now
+    db.flush()
+
+    return {
+        "account_expired": 1,
+        "referrals_revoked": len(active_referrals),
+    }
 
 
 def _check_finite_grant_integrity(db):
@@ -208,6 +248,8 @@ def _process_due_grant(db, *, grant_id, now):
             }
         )
 
+    commercial = _expire_commercial_state(db, grant=grant, now=now)
+
     grant.status = "expired"
     grant.updated_at = now
     record_audit_event(
@@ -231,6 +273,8 @@ def _process_due_grant(db, *, grant_id, now):
         "slots_retired": grant_slots_retired,
         "disable_jobs_created": grant_disable_jobs_created,
         "superseded_provision_jobs": grant_superseded_provision_jobs,
+        "commercial_accounts_expired": commercial["account_expired"],
+        "referrals_revoked": commercial["referrals_revoked"],
     }
 
 
@@ -262,6 +306,8 @@ def main():
         slots_retired = 0
         disable_jobs_created = 0
         superseded_provision_jobs = 0
+        commercial_accounts_expired = 0
+        referrals_revoked = 0
         failures = []
         wake_agent = False
 
@@ -276,6 +322,8 @@ def main():
                 slots_retired += result["slots_retired"]
                 disable_jobs_created += result["disable_jobs_created"]
                 superseded_provision_jobs += result["superseded_provision_jobs"]
+                commercial_accounts_expired += result["commercial_accounts_expired"]
+                referrals_revoked += result["referrals_revoked"]
                 wake_agent = wake_agent or bool(result["slots_retired"])
                 print(
                     "EXPIRED_GRANT="
@@ -293,6 +341,8 @@ def main():
         print(f"SLOTS_RETIREMENT_REQUESTED={slots_retired}")
         print(f"DISABLE_JOBS_CREATED={disable_jobs_created}")
         print(f"SUPERSEDED_PROVISION_JOBS={superseded_provision_jobs}")
+        print(f"COMMERCIAL_ACCOUNTS_EXPIRED={commercial_accounts_expired}")
+        print(f"REFERRALS_REVOKED={referrals_revoked}")
         print(f"EXPIRY_FAILURES={len(failures)}")
 
         for grant_id, exc_type, message in failures:
