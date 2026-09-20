@@ -24,7 +24,9 @@ from app.models import (
     AccessGrant,
     AccessGrantProtocolLimit,
     AuthSession,
+    BillingAccount,
     BillingOffer,
+    BillingPayment,
     ConnectionProfile,
     ConnectionSlot,
     Invite,
@@ -60,6 +62,21 @@ from app.services.auth_v2 import (
     revoke_session,
     user_reissue_referral_invite_token,
     user_revoke_referral_invite,
+)
+from app.services.billing import (
+    BillingConflict,
+    BillingError,
+    BillingProviderMismatch,
+    BillingUnavailable,
+    bind_provider_create_response,
+    prepare_manual_payment_intent,
+    reconcile_payment,
+)
+from app.services.yookassa import (
+    YooKassaError,
+    YooKassaRejected,
+    YooKassaUnavailable,
+    create_payment as yookassa_create_payment,
 )
 from app.services.commercial import (
     ReferralNotEligible,
@@ -976,6 +993,218 @@ def account_me_update(
     db.commit()
     db.refresh(user)
     return _account_me_response(db, user=user)
+
+
+class BillingPaymentSummary(BaseModel):
+    payment_id: UUID
+    status: Literal["created", "pending", "succeeded", "canceled"]
+    provider_status: str | None
+    kind: Literal["initial", "manual_renewal", "auto_renewal", "upgrade"]
+    amount_kopeks: int
+    currency: str
+    target_period_start: datetime | None
+    target_period_end: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    succeeded_at: datetime | None
+    confirmation_url: str | None = None
+
+
+def _billing_payment_summary(payment: BillingPayment, *, confirmation_url: str | None = None) -> BillingPaymentSummary:
+    return BillingPaymentSummary(
+        payment_id=payment.id,
+        status=payment.status,
+        provider_status=payment.provider_status,
+        kind=payment.kind,
+        amount_kopeks=int(payment.amount_kopeks),
+        currency=payment.currency,
+        target_period_start=payment.target_period_start,
+        target_period_end=payment.target_period_end,
+        created_at=payment.created_at,
+        updated_at=payment.updated_at,
+        succeeded_at=payment.succeeded_at,
+        confirmation_url=confirmation_url,
+    )
+
+
+def _provider_confirmation_url(provider: dict) -> str | None:
+    confirmation = provider.get("confirmation") or {}
+    value = str(confirmation.get("confirmation_url") or "").strip()
+    return value or None
+
+
+@router.post(
+    "/account/billing/payments",
+    response_model=BillingPaymentSummary,
+    status_code=status.HTTP_201_CREATED,
+)
+def account_billing_payment_create(
+    request: Request,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        intent = prepare_manual_payment_intent(
+            db,
+            user=user,
+            idempotence_key=idempotency_key,
+            now=utcnow(),
+        )
+        db.commit()
+        db.refresh(intent.payment)
+    except BillingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="payment cannot be created") from exc
+
+    payment = intent.payment
+    if payment.status == "succeeded" or payment.status == "canceled":
+        return _billing_payment_summary(payment)
+
+    try:
+        provider = yookassa_create_payment(
+            idempotence_key=payment.idempotence_key,
+            amount_kopeks=int(payment.amount_kopeks),
+            currency=payment.currency,
+            description="Secret Studio — доступ на один месяц",
+            billing_payment_id=str(payment.id),
+            billing_account_id=str(payment.billing_account_id),
+            kind=payment.kind,
+        )
+        payment = bind_provider_create_response(
+            db,
+            payment_id=payment.id,
+            provider=provider,
+            now=utcnow(),
+        )
+        db.commit()
+        db.refresh(payment)
+        confirmation_url = _provider_confirmation_url(provider)
+
+        if str(provider.get("status") or "") == "succeeded":
+            result = reconcile_payment(db, payment_id=payment.id)
+            db.commit()
+            db.refresh(result.payment)
+            if result.configuration is not None:
+                trigger_wg_access_agent_best_effort()
+            payment = result.payment
+        return _billing_payment_summary(payment, confirmation_url=confirmation_url)
+    except YooKassaRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail="payment provider rejected the request") from exc
+    except YooKassaUnavailable as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="payment provider unavailable; retry with the same Idempotency-Key",
+        ) from exc
+    except (BillingError, YooKassaError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="payment provider state mismatch") from exc
+
+
+@router.get("/account/billing/payments", response_model=list[BillingPaymentSummary])
+def account_billing_payments(
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    account = db.execute(select(BillingAccount).where(BillingAccount.user_id == user.id)).scalar_one_or_none()
+    if account is None:
+        return []
+    rows = list(
+        db.execute(
+            select(BillingPayment)
+            .where(BillingPayment.billing_account_id == account.id)
+            .order_by(BillingPayment.created_at.desc(), BillingPayment.id.desc())
+        ).scalars().all()
+    )
+    return [_billing_payment_summary(row) for row in rows]
+
+
+@router.get("/account/billing/payments/{payment_id}", response_model=BillingPaymentSummary)
+def account_billing_payment(
+    payment_id: UUID,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    _, user = current
+    account = db.execute(select(BillingAccount).where(BillingAccount.user_id == user.id)).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="payment not found")
+    payment = db.execute(
+        select(BillingPayment).where(
+            BillingPayment.id == payment_id,
+            BillingPayment.billing_account_id == account.id,
+        )
+    ).scalar_one_or_none()
+    if payment is None:
+        raise HTTPException(status_code=404, detail="payment not found")
+
+    if payment.provider_payment_id and payment.status in {"created", "pending"}:
+        try:
+            result = reconcile_payment(db, payment_id=payment.id)
+            db.commit()
+            db.refresh(result.payment)
+            if result.configuration is not None:
+                trigger_wg_access_agent_best_effort()
+            payment = result.payment
+        except YooKassaUnavailable as exc:
+            db.rollback()
+            raise HTTPException(status_code=503, detail="payment provider unavailable") from exc
+        except (BillingError, YooKassaError) as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="payment provider state mismatch") from exc
+    return _billing_payment_summary(payment)
+
+
+@router.post("/billing/yookassa/webhook")
+async def yookassa_webhook(request: Request, db: Session = Depends(get_db)):
+    try:
+        event = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid webhook body") from exc
+    event_type = str(event.get("event") or "")
+    if event_type not in {"payment.succeeded", "payment.canceled"}:
+        return {"status": "ignored"}
+    obj = event.get("object") or {}
+    provider_id = str(obj.get("id") or "")
+    metadata = obj.get("metadata") or {}
+    payment = None
+    if provider_id:
+        payment = db.execute(
+            select(BillingPayment).where(BillingPayment.provider_payment_id == provider_id)
+        ).scalar_one_or_none()
+    if payment is None:
+        raw_local_id = str(metadata.get("billing_payment_id") or "")
+        try:
+            local_id = UUID(raw_local_id)
+        except (ValueError, TypeError):
+            return {"status": "ignored"}
+        payment = db.get(BillingPayment, local_id)
+    if payment is None:
+        return {"status": "ignored"}
+    try:
+        result = reconcile_payment(
+            db,
+            payment_id=payment.id,
+            provider_payment_id_hint=provider_id or None,
+        )
+        db.commit()
+        if result.configuration is not None:
+            trigger_wg_access_agent_best_effort()
+    except YooKassaUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="provider reconciliation unavailable") from exc
+    except (BillingError, YooKassaError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="provider reconciliation mismatch") from exc
+    return {"status": "ok"}
 
 
 class ReferralInviteSummary(BaseModel):

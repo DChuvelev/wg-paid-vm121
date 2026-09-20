@@ -17,3 +17,7 @@ services:
         source: /opt/wg-access/runtime/secrets/admin-auth.token
         target: /opt/wg-access/runtime/secrets/admin-auth.token
         read_only: true
+      - type: bind
+        source: /root/.config/secret-studio/yookassa-test.env
+        target: /opt/wg-access/runtime/secrets/yookassa-test.env
+        read_only: true

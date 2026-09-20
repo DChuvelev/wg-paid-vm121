@@ -40,6 +40,13 @@ class Settings(BaseSettings):
 
     wg_default_node_id: str = "ddn-test"
 
+    # P29D YooKassa test-provider integration. Credentials stay in a root-only
+    # bind-mounted file and are never stored in .env/Git/STEP evidence.
+    yookassa_credentials_file: str = "/opt/wg-access/runtime/secrets/yookassa-test.env"
+    yookassa_expected_test: bool = True
+    yookassa_return_url: str = "https://access.secret-studio.ru/account"
+    yookassa_timeout_seconds: int = 15
+
     class Config:
         env_file = ".env"
         extra = "ignore"

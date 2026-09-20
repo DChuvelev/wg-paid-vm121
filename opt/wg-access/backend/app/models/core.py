@@ -298,7 +298,7 @@ class BillingPayment(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    billing_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("billing_accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    billing_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("billing_accounts.id", ondelete="SET NULL"), nullable=True, index=True)
     provider: Mapped[str] = mapped_column(String(32), default="yookassa", nullable=False)
     provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
     idempotence_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)

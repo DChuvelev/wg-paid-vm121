@@ -11,6 +11,7 @@ from app.models import (
     AccessGrant,
     AuthSession,
     BillingAccount,
+    BillingPayment,
     ConnectionProfile,
     Invite,
     MagicLinkToken,
@@ -96,14 +97,31 @@ def _expire_commercial_access_for_deletion(db: Session, *, user_id: UUID, now) -
 
 
 def _delete_commercial_account_before_user(db: Session, *, user_id: UUID) -> None:
-    # P29C has no live payment-provider integration. Trial/current commercial
-    # account rows are operational user data; billing_payments cascade through
-    # the new billing_accounts -> billing_payments FK. P29D must revisit fiscal
-    # retention before enabling real provider payments.
+    # P29D makes BillingPayment durable audit/commercial history. Deleting the
+    # operational BillingAccount must detach retained payment rows through the
+    # database ON DELETE SET NULL FK rather than deleting provider history.
     account = _commercial_account_for_user(db, user_id=user_id)
     if account is not None:
+        payment_ids = list(
+            db.execute(
+                select(BillingPayment.id).where(BillingPayment.billing_account_id == account.id)
+            ).scalars().all()
+        )
         db.delete(account)
         db.flush()
+        if payment_ids:
+            still_attached = int(
+                db.execute(
+                    select(func.count())
+                    .select_from(BillingPayment)
+                    .where(
+                        BillingPayment.id.in_(payment_ids),
+                        BillingPayment.billing_account_id.is_not(None),
+                    )
+                ).scalar_one()
+            )
+            if still_attached:
+                raise UserDeletionError("retained billing payment did not detach from deleted account")
 
 
 def finalize_user_deletion_if_ready(
