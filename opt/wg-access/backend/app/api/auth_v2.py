@@ -69,6 +69,7 @@ from app.services.billing import (
     BillingProviderMismatch,
     BillingUnavailable,
     bind_provider_create_response,
+    monthly_amount_kopeks,
     prepare_manual_payment_intent,
     reconcile_payment,
 )
@@ -863,11 +864,21 @@ class GrantSummary(BaseModel):
     protocol_limits: list[GrantProtocolLimitSummary]
 
 
+class BillingAccountSummary(BaseModel):
+    status: Literal["trial", "active_paid", "past_due", "expired"]
+    current_period_start: datetime
+    current_period_end: datetime
+    slot_quantity: int
+    monthly_amount_kopeks: int
+    currency: str
+
+
 class AccountMeResponse(BaseModel):
     user_id: UUID
     email: str
     display_name: str | None
     grants: list[GrantSummary]
+    billing: BillingAccountSummary | None
 
 
 class AccountMetadataUpdateRequest(BaseModel):
@@ -905,6 +916,33 @@ def _grant_summary(
             )
             for limit in limits
         ],
+    )
+
+
+def _account_billing_summary(db: Session, *, user: User) -> BillingAccountSummary | None:
+    account = db.execute(
+        select(BillingAccount).where(BillingAccount.user_id == user.id)
+    ).scalar_one_or_none()
+    if account is None:
+        return None
+    offer = db.get(BillingOffer, account.offer_id)
+    grant = db.get(AccessGrant, account.access_grant_id)
+    if (
+        offer is None
+        or not offer.active
+        or grant is None
+        or grant.user_id != user.id
+        or grant.plan_id != offer.plan_id
+        or user.deletion_requested_at is not None
+    ):
+        raise HTTPException(status_code=409, detail="commercial billing state unavailable")
+    return BillingAccountSummary(
+        status=account.status,
+        current_period_start=account.current_period_start,
+        current_period_end=account.current_period_end,
+        slot_quantity=int(account.slot_quantity),
+        monthly_amount_kopeks=monthly_amount_kopeks(offer, int(account.slot_quantity)),
+        currency=offer.currency,
     )
 
 
@@ -955,6 +993,7 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
             )
             for g in grants
         ],
+        billing=_account_billing_summary(db, user=user),
     )
 
 

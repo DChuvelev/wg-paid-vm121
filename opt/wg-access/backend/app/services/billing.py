@@ -91,6 +91,10 @@ def _monthly_amount_kopeks(offer: BillingOffer, quantity: int) -> int:
     )
 
 
+def monthly_amount_kopeks(offer: BillingOffer, quantity: int) -> int:
+    return _monthly_amount_kopeks(offer, quantity)
+
+
 def _commercial_account_for_user(
     db: Session,
     *,
