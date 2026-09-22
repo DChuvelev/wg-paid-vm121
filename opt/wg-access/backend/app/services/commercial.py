@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -52,6 +52,15 @@ class TrialRegistrationResult:
     account: BillingAccount
     grant: AccessGrant
     configuration: ConfigurationRequestResult
+
+
+@dataclass(frozen=True)
+class ReferralCapability:
+    enabled: bool
+    limit: int
+    active_count: int
+    remaining_count: int | None
+    can_create: bool
 
 
 def active_offer_for_plan(
@@ -161,30 +170,85 @@ def require_referral_eligible(
     )
 
 
+def referral_capability(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    now: datetime | None = None,
+) -> ReferralCapability:
+    point = now or utcnow()
+    owner = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if owner is None:
+        raise ReferralNotEligible("referral owner is unavailable")
+    limit = int(owner.referral_limit)
+    if limit < 0:
+        raise ReferralNotEligible("referral invite limit is invalid")
+    active_count = int(db.execute(
+        select(func.count(Invite.id)).where(
+            Invite.created_by_kind == "user",
+            Invite.created_by_user_id == owner.id,
+            Invite.revoked_at.is_(None),
+            Invite.used_count < Invite.max_uses,
+            (Invite.expires_at.is_(None) | (Invite.expires_at > point)),
+        )
+    ).scalar_one())
+    remaining_count = None if limit == 0 else max(limit - active_count, 0)
+    can_create = False
+    if bool(owner.referrals_enabled) and (limit == 0 or active_count < limit):
+        try:
+            require_referral_eligible(db, user_id=owner.id, now=point, lock_account=False)
+        except ReferralNotEligible:
+            pass
+        else:
+            can_create = True
+    return ReferralCapability(
+        enabled=bool(owner.referrals_enabled),
+        limit=limit,
+        active_count=active_count,
+        remaining_count=remaining_count,
+        can_create=can_create,
+    )
+
+
+def commercial_invite_is_effective(
+    db: Session,
+    *,
+    invite: Invite,
+    now: datetime | None = None,
+) -> bool:
+    if invite.plan_id is None:
+        return False
+    offer = active_offer_for_plan(db, plan_id=invite.plan_id)
+    if offer is None:
+        return False
+    if int(invite.wireguard_profile_limit or -1) != int(offer.base_slot_quantity):
+        return False
+    if invite.created_by_kind == "user":
+        if invite.created_by_user_id is None:
+            return False
+        try:
+            eligibility = _referral_eligibility(
+                db,
+                user_id=invite.created_by_user_id,
+                now=now,
+                lock_account=False,
+                require_enabled=False,
+            )
+        except ReferralNotEligible:
+            return False
+        return eligibility.offer.id == offer.id
+    return invite.created_by_kind in {"admin", "system"} and invite.created_by_user_id is None
+
+
 def commercial_referral_invite_is_effective(
     db: Session,
     *,
     invite: Invite,
     now: datetime | None = None,
 ) -> bool:
-    if invite.created_by_kind != "user" or invite.created_by_user_id is None or invite.plan_id is None:
+    if invite.created_by_kind != "user":
         return False
-    offer = active_offer_for_plan(db, plan_id=invite.plan_id)
-    if offer is None:
-        return False
-    try:
-        eligibility = _referral_eligibility(
-            db,
-            user_id=invite.created_by_user_id,
-            now=now,
-            lock_account=False,
-            require_enabled=False,
-        )
-    except ReferralNotEligible:
-        return False
-    if eligibility.offer.id != offer.id:
-        return False
-    return int(invite.wireguard_profile_limit or -1) == int(offer.base_slot_quantity)
+    return commercial_invite_is_effective(db, invite=invite, now=now)
 
 
 def create_commercial_trial_registration(
@@ -197,10 +261,10 @@ def create_commercial_trial_registration(
     request_id: str | None = None,
 ) -> TrialRegistrationResult:
     point = now or utcnow()
-    if invite.created_by_kind != "user" or invite.created_by_user_id is None or invite.plan_id is None:
-        raise CommercialRegistrationRejected("invite is not a commercial referral")
-    if not commercial_referral_invite_is_effective(db, invite=invite, now=point):
-        raise CommercialRegistrationRejected("commercial referral is no longer eligible")
+    if invite.plan_id is None:
+        raise CommercialRegistrationRejected("invite is not a commercial onboarding invite")
+    if not commercial_invite_is_effective(db, invite=invite, now=point):
+        raise CommercialRegistrationRejected("commercial invite is no longer eligible")
     offer = active_offer_for_plan(db, plan_id=invite.plan_id)
     if offer is None:
         raise CommercialRegistrationRejected("commercial offer is unavailable")

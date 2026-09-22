@@ -81,7 +81,10 @@ from app.services.yookassa import (
 )
 from app.services.commercial import (
     ReferralNotEligible,
+    TRUSTED_PILOT_PLAN_CODE,
+    active_offer_for_plan,
     commercial_referral_invite_is_effective,
+    referral_capability,
     require_referral_eligible,
 )
 from app.services.domain_v2 import (
@@ -873,12 +876,22 @@ class BillingAccountSummary(BaseModel):
     currency: str
 
 
+class ReferralCapabilitySummary(BaseModel):
+    enabled: bool
+    limit: int
+    active_count: int
+    remaining_count: int | None
+    can_create: bool
+
+
 class AccountMeResponse(BaseModel):
     user_id: UUID
     email: str
     display_name: str | None
+    account_surface: Literal["pilot", "commercial"]
     grants: list[GrantSummary]
     billing: BillingAccountSummary | None
+    referrals: ReferralCapabilitySummary
 
 
 class AccountMetadataUpdateRequest(BaseModel):
@@ -946,6 +959,31 @@ def _account_billing_summary(db: Session, *, user: User) -> BillingAccountSummar
     )
 
 
+def _account_surface(db: Session, *, user: User, grants: list[AccessGrant]) -> Literal["pilot", "commercial"]:
+    if db.execute(select(BillingAccount.id).where(BillingAccount.user_id == user.id)).scalar_one_or_none() is not None:
+        return "commercial"
+    plan_ids = {grant.plan_id for grant in grants if grant.plan_id is not None}
+    if plan_ids:
+        plan_codes = set(db.execute(select(Plan.code).where(Plan.id.in_(plan_ids))).scalars().all())
+        if TRUSTED_PILOT_PLAN_CODE in plan_codes:
+            return "pilot"
+    raise HTTPException(status_code=409, detail="account surface is unavailable")
+
+
+def _account_referral_summary(db: Session, *, user: User) -> ReferralCapabilitySummary:
+    try:
+        capability = referral_capability(db, user_id=user.id, now=utcnow())
+    except ReferralNotEligible as exc:
+        raise HTTPException(status_code=409, detail="referral capability is unavailable") from exc
+    return ReferralCapabilitySummary(
+        enabled=capability.enabled,
+        limit=capability.limit,
+        active_count=capability.active_count,
+        remaining_count=capability.remaining_count,
+        can_create=capability.can_create,
+    )
+
+
 def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
     grants = db.execute(
         select(AccessGrant).where(AccessGrant.user_id == user.id).order_by(AccessGrant.created_at.asc())
@@ -980,10 +1018,12 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
             for grant_id, count in usage_rows
         }
 
+    billing = _account_billing_summary(db, user=user)
     return AccountMeResponse(
         user_id=user.id,
         email=user.email,
         display_name=user.display_name,
+        account_surface=_account_surface(db, user=user, grants=grants),
         grants=[
             _grant_summary(
                 db,
@@ -993,7 +1033,8 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
             )
             for g in grants
         ],
-        billing=_account_billing_summary(db, user=user),
+        billing=billing,
+        referrals=_account_referral_summary(db, user=user),
     )
 
 
@@ -1942,6 +1983,8 @@ class AdminUserSummary(BaseModel):
     email: str
     display_name: str | None
     admin_note: str | None
+    referrals_enabled: bool
+    referral_limit: int
     email_verified_at: datetime
     created_at: datetime
     deletion_requested_at: datetime | None
@@ -1997,6 +2040,17 @@ class AdminUserMetadataUpdateResponse(BaseModel):
     user_id: UUID
     display_name: str | None
     admin_note: str | None
+
+
+class AdminUserReferralPolicyUpdateRequest(BaseModel):
+    enabled: bool
+    limit: int = Field(ge=0)
+
+
+class AdminUserReferralPolicyResponse(BaseModel):
+    user_id: UUID
+    enabled: bool
+    limit: int
 
 
 class AdminUserDeleteResponse(BaseModel):
@@ -2144,11 +2198,8 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
     dependencies=[Depends(_require_admin)],
 )
 def admin_list_plans(db: Session = Depends(get_db)):
-    commercial_plan_ids = select(BillingOffer.plan_id)
     rows = db.execute(
-        select(Plan)
-        .where(Plan.id.not_in(commercial_plan_ids))
-        .order_by(Plan.created_at.asc())
+        select(Plan).order_by(Plan.created_at.asc())
     ).scalars().all()
     return [
         AdminPlanSummary(
@@ -2263,6 +2314,10 @@ def admin_update_invite_wireguard_limit(
     if invite.created_by_kind == "user":
         db.rollback()
         raise HTTPException(status_code=409, detail="user referral invite is not admin-mutable")
+    offer = active_offer_for_plan(db, plan_id=invite.plan_id) if invite.plan_id is not None else None
+    if offer is not None and int(payload.profile_limit) != int(offer.base_slot_quantity):
+        db.rollback()
+        raise HTTPException(status_code=409, detail="commercial onboarding configuration limit is fixed")
     now = utcnow()
     if _invite_lifecycle_state(invite, now=now) not in {"active", "awaiting_confirmation"}:
         db.rollback()
@@ -2661,6 +2716,8 @@ def admin_list_users(
                 email=user.email,
                 display_name=user.display_name,
                 admin_note=user.admin_note,
+                referrals_enabled=bool(user.referrals_enabled),
+                referral_limit=int(user.referral_limit),
                 email_verified_at=user.email_verified_at,
                 created_at=user.created_at,
                 deletion_requested_at=user.deletion_requested_at,
@@ -2712,6 +2769,51 @@ def admin_update_user_metadata(
         user_id=user.id,
         display_name=user.display_name,
         admin_note=user.admin_note,
+    )
+
+
+@router.patch(
+    "/admin/users/{user_id}/referral-policy",
+    response_model=AdminUserReferralPolicyResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_update_user_referral_policy(
+    user_id: UUID,
+    payload: AdminUserReferralPolicyUpdateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    user = db.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    before_enabled = bool(user.referrals_enabled)
+    before_limit = int(user.referral_limit)
+    user.referrals_enabled = bool(payload.enabled)
+    user.referral_limit = int(payload.limit)
+    record_audit_event(
+        db,
+        event_type="admin.user_referral_policy.updated",
+        actor_kind="admin",
+        actor_user_id=None,
+        object_type="user",
+        object_id=str(user.id),
+        request_id=_request_id(request),
+        payload={
+            "enabled_before": before_enabled,
+            "enabled_after": bool(user.referrals_enabled),
+            "limit_before": before_limit,
+            "limit_after": int(user.referral_limit),
+            "existing_invites_revoked": False,
+        },
+    )
+    db.commit()
+    db.refresh(user)
+    return AdminUserReferralPolicyResponse(
+        user_id=user.id,
+        enabled=bool(user.referrals_enabled),
+        limit=int(user.referral_limit),
     )
 
 

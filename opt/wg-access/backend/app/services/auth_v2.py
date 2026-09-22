@@ -23,6 +23,7 @@ from app.services.commercial import (
     CommercialRegistrationRejected,
     ReferralNotEligible,
     active_offer_for_plan,
+    commercial_invite_is_effective,
     commercial_referral_invite_is_effective,
     create_commercial_trial_registration,
     require_referral_eligible,
@@ -187,10 +188,15 @@ def issue_invite(
         if issuer_user_id is not None:
             raise AuthV2Error("non-user invite issuer cannot have a user id")
         if offer is not None:
-            raise AuthV2Error("commercial referral plans are user-invite only")
-        wg_limit = plan.default_wireguard_limit if wireguard_profile_limit is None else int(wireguard_profile_limit)
-        if wg_limit < 0:
-            raise AuthV2Error("wireguard profile limit is invalid")
+            if int(plan.default_wireguard_limit) != int(offer.base_slot_quantity) or int(plan.default_amneziawg_limit) != int(offer.base_slot_quantity):
+                raise AuthV2Error("commercial plan configuration limit drift")
+            if wireguard_profile_limit is not None and int(wireguard_profile_limit) != int(offer.base_slot_quantity):
+                raise AuthV2Error("commercial onboarding configuration limit is fixed")
+            wg_limit = int(offer.base_slot_quantity)
+        else:
+            wg_limit = plan.default_wireguard_limit if wireguard_profile_limit is None else int(wireguard_profile_limit)
+            if wg_limit < 0:
+                raise AuthV2Error("wireguard profile limit is invalid")
         issuer_label = str(created_by_label or ("Admin" if issuer_kind == "admin" else "System")).strip()
         if not issuer_label or len(issuer_label) > 320:
             raise AuthV2Error("invite issuer label is invalid")
@@ -229,7 +235,8 @@ def issue_invite(
             "wireguard_profile_limit": wg_limit,
             "max_uses": 1,
             "created_by_kind": issuer_kind,
-            "commercial_referral": offer is not None,
+            "commercial_onboarding": offer is not None,
+            "commercial_referral": issuer_kind == "user" and offer is not None,
         },
     )
     return InviteIssueResult(invite=row, token=tok.raw)
@@ -265,7 +272,7 @@ def _assert_invite_active(db: Session, *, invite: Invite, now: datetime) -> Plan
         raise InviteRejected("invalid invite")
     offer = active_offer_for_plan(db, plan_id=plan.id)
     if offer is not None:
-        if not commercial_referral_invite_is_effective(db, invite=invite, now=now):
+        if not commercial_invite_is_effective(db, invite=invite, now=now):
             raise InviteRejected("invalid invite")
     elif invite.created_by_kind == "user":
         # User-generated invites are commercial referrals only. Do not let a
