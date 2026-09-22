@@ -22,11 +22,16 @@ from app.db.base import Base
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("referral_limit >= 0", name="users_referral_limit_nonnegative"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(320), nullable=False, index=True, unique=True)
     display_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
     admin_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    referrals_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False)
+    referral_limit: Mapped[int] = mapped_column(Integer, default=3, server_default=text("3"), nullable=False)
     email_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     deletion_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)

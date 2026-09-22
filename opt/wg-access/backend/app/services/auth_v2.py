@@ -177,7 +177,10 @@ def issue_invite(
                 (Invite.expires_at.is_(None) | (Invite.expires_at > now)),
             )
         ).scalar_one())
-        if active_count >= int(offer.active_referral_invite_limit):
+        referral_limit = int(eligibility.owner.referral_limit)
+        if referral_limit < 0:
+            raise AuthV2Error("referral invite limit is invalid")
+        if referral_limit != 0 and active_count >= referral_limit:
             raise AuthV2Error("active referral invite limit reached")
         issuer_label = normalize_email(issuer.email)
     else:

@@ -25,6 +25,7 @@ from app.services.domain_v2 import (
 )
 
 COMMERCIAL_OFFER_CODE = "commercial-rub-v1"
+TRUSTED_PILOT_PLAN_CODE = "trusted-pilot"
 
 
 class CommercialError(RuntimeError):
@@ -41,7 +42,8 @@ class CommercialRegistrationRejected(CommercialError):
 
 @dataclass(frozen=True)
 class ReferralEligibility:
-    account: BillingAccount
+    owner: User
+    account: BillingAccount | None
     offer: BillingOffer
 
 
@@ -77,25 +79,52 @@ def commercial_offer(db: Session) -> BillingOffer:
     return row
 
 
-def require_referral_eligible(
+def _referral_eligibility(
     db: Session,
     *,
     user_id: uuid.UUID,
-    now: datetime | None = None,
-    lock_account: bool = False,
+    now: datetime | None,
+    lock_account: bool,
+    require_enabled: bool,
 ) -> ReferralEligibility:
     point = now or utcnow()
-    query = select(BillingAccount).where(BillingAccount.user_id == user_id)
+
+    owner_query = select(User).where(User.id == user_id)
     if lock_account:
-        query = query.with_for_update()
-    account = db.execute(query).scalar_one_or_none()
-    if account is None or account.status != "active_paid":
-        raise ReferralNotEligible("referral privilege requires active paid access")
-    if account.current_period_start > point or account.current_period_end <= point:
-        raise ReferralNotEligible("paid period is not active")
-    owner = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+        owner_query = owner_query.with_for_update()
+    owner = db.execute(owner_query).scalar_one_or_none()
     if owner is None or owner.deletion_requested_at is not None:
         raise ReferralNotEligible("referral owner is unavailable")
+    if require_enabled and not bool(owner.referrals_enabled):
+        raise ReferralNotEligible("referral privilege is disabled")
+
+    account_query = select(BillingAccount).where(BillingAccount.user_id == user_id)
+    if lock_account:
+        account_query = account_query.with_for_update()
+    account = db.execute(account_query).scalar_one_or_none()
+
+    if account is None:
+        trusted_grant = db.execute(
+            select(AccessGrant.id)
+            .join(Plan, Plan.id == AccessGrant.plan_id)
+            .where(
+                AccessGrant.user_id == user_id,
+                AccessGrant.status == "active",
+                AccessGrant.valid_from <= point,
+                (AccessGrant.valid_until.is_(None) | (AccessGrant.valid_until > point)),
+                Plan.code == TRUSTED_PILOT_PLAN_CODE,
+                Plan.active.is_(True),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if trusted_grant is None:
+            raise ReferralNotEligible("trusted-pilot entitlement is not active")
+        return ReferralEligibility(owner=owner, account=None, offer=commercial_offer(db))
+
+    if account.status != "active_paid":
+        raise ReferralNotEligible("commercial referral privilege requires active paid access")
+    if account.current_period_start > point or account.current_period_end <= point:
+        raise ReferralNotEligible("paid period is not active")
     offer = db.get(BillingOffer, account.offer_id)
     if offer is None or not offer.active:
         raise ReferralNotEligible("commercial offer is unavailable")
@@ -113,7 +142,23 @@ def require_referral_eligible(
     ).scalar_one_or_none()
     if successful_payment is None:
         raise ReferralNotEligible("successful own payment is required")
-    return ReferralEligibility(account=account, offer=offer)
+    return ReferralEligibility(owner=owner, account=account, offer=offer)
+
+
+def require_referral_eligible(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    now: datetime | None = None,
+    lock_account: bool = False,
+) -> ReferralEligibility:
+    return _referral_eligibility(
+        db,
+        user_id=user_id,
+        now=now,
+        lock_account=lock_account,
+        require_enabled=True,
+    )
 
 
 def commercial_referral_invite_is_effective(
@@ -128,11 +173,12 @@ def commercial_referral_invite_is_effective(
     if offer is None:
         return False
     try:
-        eligibility = require_referral_eligible(
+        eligibility = _referral_eligibility(
             db,
             user_id=invite.created_by_user_id,
             now=now,
             lock_account=False,
+            require_enabled=False,
         )
     except ReferralNotEligible:
         return False
