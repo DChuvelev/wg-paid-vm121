@@ -314,8 +314,8 @@ def find_registry_profile(peer, rows):
     return row
 
 
-def lifecycle_enable_or_ensure(peer):
-    rows = remote_registry()
+def lifecycle_enable_or_ensure(peer, registry_rows=None):
+    rows = remote_registry() if registry_rows is None else registry_rows
     existing = find_registry_profile(peer, rows)
     if existing is None:
         profile_id = peer["id"]
@@ -413,23 +413,35 @@ IFS= read -r desired_generation
         raise RuntimeError("VM100 lifecycle disable did not return an accepted result")
 
 
+def fetch_enabled_peers_for_protocol(protocol):
+    protocol = require_protocol(protocol)
+    query = parse.urlencode({"node_id": NODE_ID, "protocol": protocol})
+    rows = http_json("GET", f"/agent/peers?{query}") or []
+    desired = {}
+    for row in rows:
+        peer = normalize_peer_payload(row, expected_protocol=protocol)
+        public_key = peer["public_key"]
+        if public_key in desired:
+            raise RuntimeError(f"duplicate public key in {protocol} desired state")
+        desired[public_key] = peer
+    return desired
+
+
 def fetch_enabled_peers():
     desired = {}
 
     for protocol in MANAGED_PROTOCOLS:
-        query = parse.urlencode({"node_id": NODE_ID, "protocol": protocol})
-        rows = http_json("GET", f"/agent/peers?{query}") or []
-
-        for row in rows:
-            peer = normalize_peer_payload(row, expected_protocol=protocol)
-            public_key = peer["public_key"]
+        protocol_desired = fetch_enabled_peers_for_protocol(protocol)
+        for public_key, peer in protocol_desired.items():
             if public_key in desired:
                 raise RuntimeError(
                     "duplicate public key across managed protocol desired state"
                 )
             desired[public_key] = peer
-
-        log(f"sync desired enabled peers protocol={protocol}: {len(rows)}")
+        log(
+            f"sync desired enabled peers protocol={protocol}: "
+            f"{len(protocol_desired)}"
+        )
 
     return desired
 
@@ -440,18 +452,28 @@ def sync_enabled_peers():
 
     registry_before = remote_registry()
     log(f"sync VM100 lifecycle registry peers before: {len(registry_before)}")
+    changed = False
 
     for public_key in sorted(desired):
         peer = desired[public_key]
-        profile_id, mode = lifecycle_enable_or_ensure(peer)
+        existing = find_registry_profile(peer, registry_before)
+        if (
+            existing is not None
+            and existing["protocol"] == peer["protocol"]
+            and existing["desired_generation"] == desired_generation(peer)
+        ):
+            continue
+        profile_id, mode = lifecycle_enable_or_ensure(
+            peer, registry_rows=registry_before
+        )
+        changed = True
         log(
             "sync lifecycle "
             f"{mode} protocol={peer['protocol']} peer_id={peer['id']} "
             f"profile_id={profile_id} tunnel_ip={peer['tunnel_ip']}"
         )
 
-    registry_mid = remote_registry()
-    for row in sorted(registry_mid, key=lambda item: item["profile_id"]):
+    for row in sorted(registry_before, key=lambda item: item["profile_id"]):
         if row["protocol"] not in MANAGED_PROTOCOLS:
             continue
         peer = desired.get(row["public_key"])
@@ -463,13 +485,14 @@ def sync_enabled_peers():
                 f"{row['protocol']}|{row['public_key']}|{row['tunnel_ip']}"
             ),
         )
+        changed = True
         log(
             "sync lifecycle --disable "
             f"protocol={row['protocol']} profile_id={row['profile_id']} "
             f"tunnel_ip={row['tunnel_ip']}"
         )
 
-    registry_after = remote_registry()
+    registry_after = remote_registry() if changed else registry_before
     actual = {
         (row["protocol"], row["public_key"], row["tunnel_ip"])
         for row in registry_after
@@ -500,7 +523,10 @@ def sync_enabled_peers():
         }
     save_state(state)
 
-    log(f"sync VM100 lifecycle registry peers after: {len(registry_after)}")
+    log(
+        f"sync VM100 lifecycle registry peers after: {len(registry_after)} "
+        f"changed={1 if changed else 0}"
+    )
     return desired, registry_after
 
 
@@ -543,74 +569,88 @@ def fetch_pending_jobs():
     return pending
 
 
-def verify_job_against_reconciled_state(
-    job,
-    desired,
-    registry_rows,
-    *,
-    expected_protocol,
-):
-    action = job["action"]
-    payload = job["payload_json"]
+def targeted_peer_for_job(job, *, expected_protocol):
     protocol = resolve_job_protocol(job, expected_protocol=expected_protocol)
-    peer_id = str(job.get("peer_id") or job.get("connection_profile_id") or "")
+    payload = job.get("payload_json") or {}
+    peer_id = str(job.get("connection_profile_id") or job.get("peer_id") or "")
+    public_key = require_wg_key("public_key", payload["public_key"])
+    tunnel_ip = require_tunnel_ip(payload["tunnel_ip"])
+
+    desired = fetch_enabled_peers_for_protocol(protocol)
+    peer = desired.get(public_key)
+    if (
+        peer is None
+        or str(peer["id"]) != peer_id
+        or peer["tunnel_ip"] != tunnel_ip
+    ):
+        raise RuntimeError(
+            f"targeted desired peer mismatch protocol={protocol} peer_id={peer_id}"
+        )
+    return peer
+
+
+def apply_targeted_job(job, *, expected_protocol):
+    action = job["action"]
+    payload = job.get("payload_json") or {}
+    protocol = resolve_job_protocol(job, expected_protocol=expected_protocol)
+    profile_id = str(
+        job.get("connection_profile_id")
+        or job.get("peer_id")
+        or payload.get("profile_id")
+        or ""
+    )
+    if not profile_id:
+        raise RuntimeError("job profile/peer id is required")
 
     if action in {"enable_peer", "provision_profile"}:
-        public_key = require_wg_key("public_key", payload["public_key"])
-        tunnel_ip = require_tunnel_ip(payload["tunnel_ip"])
-        row = next(
-            (
-                item
-                for item in registry_rows
-                if item["public_key"] == public_key
-                and item["tunnel_ip"] == tunnel_ip
-                and item["protocol"] == protocol
-            ),
-            None,
+        peer = targeted_peer_for_job(job, expected_protocol=protocol)
+        registry_before = remote_registry()
+        runtime_profile_id, mode = lifecycle_enable_or_ensure(
+            peer, registry_rows=registry_before
         )
-        desired_peer = desired.get(public_key)
+        registry_after = remote_registry()
+        row = find_registry_profile(peer, registry_after)
         if (
             row is None
-            or desired_peer is None
-            or desired_peer["protocol"] != protocol
+            or row["profile_id"] != runtime_profile_id
+            or row["desired_generation"] != desired_generation(peer)
         ):
             raise RuntimeError(
-                f"enable job not satisfied by lifecycle reconcile peer_id={peer_id}"
+                f"targeted enable verification failed peer_id={profile_id}"
             )
         log(
-            f"REAL {action} verified via VM100 lifecycle "
-            f"protocol={protocol} peer_id={peer_id} tunnel_ip={tunnel_ip}"
+            f"REAL {action} targeted via VM100 lifecycle "
+            f"mode={mode} protocol={protocol} peer_id={profile_id} "
+            f"tunnel_ip={peer['tunnel_ip']}"
         )
         return
 
     if action in {"disable_peer", "disable_profile"}:
         public_key = require_wg_key("public_key", payload["public_key"])
+        tunnel_ip = require_tunnel_ip(payload["tunnel_ip"])
+        lifecycle_disable_profile(
+            profile_id,
+            reason_seed=f"{protocol}|{public_key}|{tunnel_ip}",
+        )
+        registry_after = remote_registry()
         if any(
-            item["protocol"] == protocol and item["public_key"] == public_key
-            for item in registry_rows
+            row["protocol"] == protocol
+            and (row["profile_id"] == profile_id or row["public_key"] == public_key)
+            for row in registry_after
         ):
             raise RuntimeError(
-                f"disable job still present in VM100 lifecycle registry peer_id={peer_id}"
+                f"targeted disable verification failed peer_id={profile_id}"
             )
         log(
-            f"REAL {action} verified via VM100 lifecycle "
-            f"protocol={protocol} peer_id={peer_id}"
+            f"REAL {action} targeted via VM100 lifecycle "
+            f"protocol={protocol} peer_id={profile_id}"
         )
         return
 
     raise RuntimeError(f"unsupported action: {action}")
 
 
-def run_once():
-    # VM121 owns desired membership only. VM100 lifecycle owns runtime peer +
-    # selector membership transaction. The agent never executes direct runtime writes.
-    desired, registry_rows = sync_enabled_peers()
-    pending = fetch_pending_jobs()
-
-    if not pending:
-        log("no pending jobs")
-        return 0
-
+def process_pending_jobs(pending):
     log(f"fetched pending jobs total: {len(pending)}")
 
     for protocol, job in pending:
@@ -622,12 +662,7 @@ def run_once():
 
         try:
             started = http_json("POST", f"/agent/jobs/{job_id}/start")
-            verify_job_against_reconciled_state(
-                started,
-                desired,
-                registry_rows,
-                expected_protocol=protocol,
-            )
+            apply_targeted_job(started, expected_protocol=protocol)
             completed = http_json("POST", f"/agent/jobs/{job_id}/complete")
             log(
                 f"completed job_id={completed['id']} protocol={protocol} "
@@ -641,6 +676,20 @@ def run_once():
             except Exception as fail_exc:
                 log(f"failed to report failure job_id={job_id}: {fail_exc}")
 
+
+def run_once():
+    # Fast path: durable jobs are user-visible work and must not wait behind a
+    # full all-peer reconcile. VM100 lifecycle remains the only runtime writer.
+    pending = fetch_pending_jobs()
+    if pending:
+        process_pending_jobs(pending)
+        return 0
+
+    # No due job exists: retain the existing desired-state reconcile as the
+    # periodic/fallback convergence mechanism. Unchanged peers are verified
+    # from one registry snapshot and do not receive redundant lifecycle --ensure.
+    log("no pending jobs; running fallback reconcile")
+    sync_enabled_peers()
     return 0
 
 
