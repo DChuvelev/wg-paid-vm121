@@ -368,15 +368,16 @@ def _apply_succeeded_payment(
         _extend_live_mirror(db, account=account, grant=grant, period_end=target_end)
         configuration = None
     elif account.status == "trial" and account.current_period_end > captured_at:
-        target_start = captured_at
+        # Preserve the unused trial tail. The paid month begins at the existing
+        # trial boundary, while the already-active entitlement window keeps its
+        # original start so access and paid-account eligibility remain continuous.
+        target_start = account.current_period_end
         target_end = add_calendar_month(target_start)
-        account.current_period_start = target_start
         account.current_period_end = target_end
         account.status = "active_paid"
         account.grace_until = None
         account.cancel_at_period_end = False
         grant.status = "active"
-        grant.valid_from = target_start
         _extend_live_mirror(db, account=account, grant=grant, period_end=target_end)
         configuration = None
     elif account.status == "expired" or account.current_period_end <= captured_at:
