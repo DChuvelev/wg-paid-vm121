@@ -64,6 +64,7 @@ class ReconcileResult:
     payment: BillingPayment
     state_changed: bool
     configuration: ConfigurationRequestResult | None
+    confirmation_url: str | None = None
 
 
 def validate_idempotence_key(value: str) -> str:
@@ -432,6 +433,8 @@ def reconcile_payment(
     provider = get_payment(provider_id)
     if str(provider.get("id") or "") != provider_id:
         raise BillingProviderMismatch("provider lookup returned a different payment id")
+    confirmation = provider.get("confirmation") or {}
+    confirmation_url = str(confirmation.get("confirmation_url") or "").strip() or None
 
     payment = db.execute(
         select(BillingPayment).where(BillingPayment.id == payment_id).with_for_update()
@@ -475,7 +478,12 @@ def reconcile_payment(
         if payment.status not in {"succeeded", "canceled"}:
             payment.status = "pending"
         db.flush()
-        return ReconcileResult(payment=payment, state_changed=False, configuration=None)
+        return ReconcileResult(
+            payment=payment,
+            state_changed=False,
+            configuration=None,
+            confirmation_url=confirmation_url,
+        )
 
     if provider_status == "canceled":
         if payment.status == "succeeded":

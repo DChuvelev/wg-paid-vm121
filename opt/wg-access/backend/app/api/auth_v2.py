@@ -1226,6 +1226,7 @@ def account_billing_payment(
     if payment is None:
         raise HTTPException(status_code=404, detail="payment not found")
 
+    confirmation_url = None
     if payment.provider_payment_id and payment.status in {"created", "pending"}:
         try:
             result = reconcile_payment(db, payment_id=payment.id)
@@ -1234,13 +1235,14 @@ def account_billing_payment(
             if result.configuration is not None:
                 trigger_wg_access_agent_best_effort()
             payment = result.payment
+            confirmation_url = result.confirmation_url
         except YooKassaUnavailable as exc:
             db.rollback()
             raise HTTPException(status_code=503, detail="payment provider unavailable") from exc
         except (BillingError, YooKassaError) as exc:
             db.rollback()
             raise HTTPException(status_code=409, detail="payment provider state mismatch") from exc
-    return _billing_payment_summary(payment)
+    return _billing_payment_summary(payment, confirmation_url=confirmation_url)
 
 
 @router.post("/billing/yookassa/webhook")
