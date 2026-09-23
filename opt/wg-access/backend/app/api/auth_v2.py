@@ -12,7 +12,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -2637,6 +2637,7 @@ def admin_runtime_connections(db: Session = Depends(get_db)):
 )
 def admin_list_users(
     email: str | None = None,
+    query: str | None = None,
     limit: int = 100,
     offset: int = 0,
     sort_by: Literal[
@@ -2678,6 +2679,14 @@ def admin_list_users(
     )
     if email is not None and str(email).strip():
         stmt = stmt.where(User.email == str(email).strip().casefold())
+    if query is not None and str(query).strip():
+        search_query = str(query).strip().casefold()
+        stmt = stmt.where(
+            or_(
+                func.lower(User.email).contains(search_query, autoescape=True),
+                func.lower(User.display_name).contains(search_query, autoescape=True),
+            )
+        )
 
     sort_columns = {
         "email": User.email,
