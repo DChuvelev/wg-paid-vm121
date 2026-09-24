@@ -27,6 +27,7 @@ from app.models import (
     BillingAccount,
     BillingOffer,
     BillingPayment,
+    BulkInviteCampaign,
     ConnectionProfile,
     ConnectionSlot,
     Invite,
@@ -37,6 +38,7 @@ from app.models import (
 )
 from app.services.auth_v2 import (
     AuthV2Error,
+    BulkInviteRejected,
     InviteRejected,
     InviteResendTooSoon,
     MagicLinkIssueResult,
@@ -47,20 +49,25 @@ from app.services.auth_v2 import (
     admin_reissue_transferable_invite_token,
     admin_resend_invite_registration,
     authenticate_session,
+    bulk_invite_campaign_state,
     change_invite_registration_email,
     consume_magic_link,
     email_fingerprint,
     enforce_rate_limit,
+    issue_bulk_invite_campaign,
     issue_invite,
+    inspect_bulk_invite_campaign,
     inspect_expired_registration_magic_link,
     inspect_invite,
     invalidate_registration_tokens,
     issue_magic_link_for_email,
     latest_registration_token,
+    request_bulk_invite_registration,
     request_invite_registration,
     request_id_or_new,
     resend_expired_registration_magic_link,
     resend_invite_registration,
+    revoke_bulk_invite_campaign,
     revoke_session,
     user_reissue_referral_invite_token,
     user_revoke_referral_invite,
@@ -649,6 +656,78 @@ def inspect_invite_route(
     except InviteRejected as exc:
         raise HTTPException(status_code=404, detail="invite not found") from exc
     return _public_invite_inspect(db, invite=invite, now=utcnow())
+
+
+class BulkInviteInspectRequest(BaseModel):
+    campaign_token: str
+
+
+class BulkInviteInspectResponse(BaseModel):
+    state: Literal["active", "full", "expired", "revoked"]
+
+
+@router.post("/auth/bulk-invites/inspect", response_model=BulkInviteInspectResponse)
+def inspect_bulk_invite_route(
+    payload: BulkInviteInspectRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    try:
+        campaign = inspect_bulk_invite_campaign(db, token=payload.campaign_token)
+    except BulkInviteRejected as exc:
+        raise HTTPException(status_code=404, detail="bulk invite not found") from exc
+    return BulkInviteInspectResponse(state=bulk_invite_campaign_state(campaign, now=utcnow()))
+
+
+class BulkInviteRedeemRequest(BaseModel):
+    campaign_token: str
+    email: EmailStr
+
+
+@router.post("/auth/bulk-invites/redeem", status_code=status.HTTP_202_ACCEPTED)
+def redeem_bulk_invite_route(
+    payload: BulkInviteRedeemRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    req = _request_id(request)
+    try:
+        enforce_rate_limit(
+            db,
+            scope="bulk_invite_redeem",
+            subject=f"{_client_key(request)}|{payload.campaign_token[:16]}",
+            limit=settings.auth_redeem_rate_limit,
+            window_seconds=settings.auth_rate_window_seconds,
+            request_id=req,
+        )
+        db.commit()
+    except RateLimitExceeded as exc:
+        db.commit()
+        raise HTTPException(status_code=429, detail="too many requests") from exc
+
+    try:
+        result = request_bulk_invite_registration(
+            db,
+            campaign_token=payload.campaign_token,
+            email=str(payload.email),
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
+            request_id=req,
+        )
+        _deliver_magic_link_result(db, result=result, request_id=req)
+        db.commit()
+    except (BulkInviteRejected, InviteRejected, InvalidIdentity) as exc:
+        db.rollback()
+        record_audit_event(
+            db,
+            event_type="auth.bulk_invite.redeem_rejected",
+            actor_kind="anonymous",
+            request_id=req,
+            payload={"email_hash": email_fingerprint(str(payload.email))},
+        )
+        db.commit()
+        raise HTTPException(status_code=400, detail="bulk invite unavailable") from exc
+    return GENERIC_LOGIN_RESPONSE
 
 
 class InviteResendRequest(BaseModel):
@@ -2099,6 +2178,32 @@ class AdminInviteSummary(BaseModel):
     can_revoke: bool
 
 
+class AdminBulkInviteSummary(BaseModel):
+    campaign_id: UUID
+    label: str
+    plan_id: UUID
+    max_registrations: int
+    used_count: int
+    trial_days: int
+    expires_at: datetime
+    revoked_at: datetime | None
+    created_at: datetime
+    state: Literal["active", "full", "expired", "revoked"]
+
+
+class AdminBulkInviteCreateRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=160)
+    plan_id: UUID
+    max_registrations: int = Field(ge=1, le=10000)
+    trial_days: int = Field(ge=1, le=30)
+    expires_at: datetime
+
+
+class AdminBulkInviteCreateResponse(BaseModel):
+    campaign: AdminBulkInviteSummary
+    campaign_token: str
+
+
 class AdminUserSummary(BaseModel):
     user_id: UUID
     email: str
@@ -2266,6 +2371,21 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
     )
 
 
+def _admin_bulk_invite_summary(campaign: BulkInviteCampaign, *, now: datetime | None = None) -> AdminBulkInviteSummary:
+    return AdminBulkInviteSummary(
+        campaign_id=campaign.id,
+        label=campaign.label,
+        plan_id=campaign.plan_id,
+        max_registrations=int(campaign.max_registrations),
+        used_count=int(campaign.used_count),
+        trial_days=int(campaign.trial_days),
+        expires_at=campaign.expires_at,
+        revoked_at=campaign.revoked_at,
+        created_at=campaign.created_at,
+        state=bulk_invite_campaign_state(campaign, now=now),
+    )
+
+
 def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
     grants = db.execute(
         select(AccessGrant)
@@ -2335,13 +2455,85 @@ def admin_list_plans(db: Session = Depends(get_db)):
     ]
 
 
+@router.post(
+    "/admin/bulk-invites",
+    response_model=AdminBulkInviteCreateResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_create_bulk_invite(
+    payload: AdminBulkInviteCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    try:
+        result = issue_bulk_invite_campaign(
+            db,
+            label=payload.label,
+            plan_id=payload.plan_id,
+            max_registrations=payload.max_registrations,
+            trial_days=payload.trial_days,
+            expires_at=payload.expires_at,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(result.campaign)
+    except BulkInviteRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="bulk invite cannot be created") from exc
+    return AdminBulkInviteCreateResponse(
+        campaign=_admin_bulk_invite_summary(result.campaign, now=utcnow()),
+        campaign_token=result.token,
+    )
+
+
+@router.get(
+    "/admin/bulk-invites",
+    response_model=list[AdminBulkInviteSummary],
+    dependencies=[Depends(_require_admin)],
+)
+def admin_list_bulk_invites(db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(BulkInviteCampaign).order_by(BulkInviteCampaign.created_at.desc())
+    ).scalars().all()
+    point = utcnow()
+    return [_admin_bulk_invite_summary(row, now=point) for row in rows]
+
+
+@router.post(
+    "/admin/bulk-invites/{campaign_id}/revoke",
+    response_model=AdminBulkInviteSummary,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_revoke_bulk_invite(
+    campaign_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    try:
+        campaign = revoke_bulk_invite_campaign(
+            db,
+            campaign_id=campaign_id,
+            request_id=_request_id(request),
+        )
+        db.commit()
+        db.refresh(campaign)
+    except BulkInviteRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="bulk invite not found") from exc
+    return _admin_bulk_invite_summary(campaign, now=utcnow())
+
+
 @router.get(
     "/admin/invites",
     response_model=list[AdminInviteSummary],
     dependencies=[Depends(_require_admin)],
 )
 def admin_list_invites(db: Session = Depends(get_db)):
-    rows = db.execute(select(Invite).order_by(Invite.created_at.desc())).scalars().all()
+    rows = db.execute(
+        select(Invite)
+        .where(Invite.bulk_campaign_id.is_(None))
+        .order_by(Invite.created_at.desc())
+    ).scalars().all()
     point = utcnow()
     return [_admin_invite_summary(db, row, now=point) for row in rows]
 
@@ -2432,6 +2624,9 @@ def admin_update_invite_wireguard_limit(
     ).scalar_one_or_none()
     if invite is None:
         raise HTTPException(status_code=404, detail="invite not found")
+    if invite.bulk_campaign_id is not None:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="bulk child invite is not admin-mutable")
     if invite.created_by_kind == "user":
         db.rollback()
         raise HTTPException(status_code=409, detail="user referral invite is not admin-mutable")
@@ -2524,6 +2719,9 @@ def admin_revoke_invite(
     ).scalar_one_or_none()
     if invite is None:
         raise HTTPException(status_code=404, detail="invite not found")
+    if invite.bulk_campaign_id is not None:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="bulk child invite is not admin-mutable")
     now = utcnow()
     state = _invite_lifecycle_state(invite, now=now)
     if state == "used":

@@ -87,6 +87,27 @@ class AccessGrantProtocolLimit(Base):
     profile_limit: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class BulkInviteCampaign(Base):
+    __tablename__ = "bulk_invite_campaigns"
+    __table_args__ = (
+        CheckConstraint("max_registrations >= 1", name="bulk_invite_campaigns_max_positive"),
+        CheckConstraint("used_count >= 0 AND used_count <= max_registrations", name="bulk_invite_campaigns_used_count_range"),
+        CheckConstraint("trial_days >= 1", name="bulk_invite_campaigns_trial_days_positive"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    label: Mapped[str] = mapped_column(String(160), nullable=False)
+    # Soft reference by design: historical plans.id is not a live-FK-safe target.
+    plan_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    max_registrations: Mapped[int] = mapped_column(Integer, nullable=False)
+    used_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    trial_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
 class Invite(Base):
     __tablename__ = "invites"
     __table_args__ = (
@@ -94,6 +115,11 @@ class Invite(Base):
         CheckConstraint("used_count >= 0 AND used_count <= max_uses", name="invites_used_count_range"),
         CheckConstraint("wireguard_profile_limit >= 0", name="invites_wireguard_profile_limit_nonnegative"),
         CheckConstraint("created_by_kind IN ('admin','user','system')", name="invites_created_by_kind_check"),
+        CheckConstraint(
+            "bulk_campaign_id IS NULL OR (intended_email IS NOT NULL AND created_by_kind = 'system' AND created_by_user_id IS NULL AND max_uses = 1)",
+            name="invites_bulk_child_shape_check",
+        ),
+        UniqueConstraint("bulk_campaign_id", "intended_email", name="uq_invites_bulk_campaign_email"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -105,6 +131,12 @@ class Invite(Base):
     pending_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     wireguard_profile_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True)
+    bulk_campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("bulk_invite_campaigns.id"),
+        nullable=True,
+        index=True,
+    )
     max_uses: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     used_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

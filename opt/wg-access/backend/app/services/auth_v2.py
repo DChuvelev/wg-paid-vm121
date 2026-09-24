@@ -6,13 +6,15 @@ import hashlib
 import secrets
 import uuid
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models import (
     AccessGrant,
     AuditEvent,
     AuthSession,
+    BulkInviteCampaign,
     Invite,
     InviteRedemption,
     MagicLinkToken,
@@ -48,6 +50,10 @@ class InviteRejected(AuthV2Error):
     pass
 
 
+class BulkInviteRejected(AuthV2Error):
+    pass
+
+
 class MagicLinkRejected(AuthV2Error):
     pass
 
@@ -75,6 +81,12 @@ class SecretToken:
 @dataclass(frozen=True)
 class InviteIssueResult:
     invite: Invite
+    token: str
+
+
+@dataclass(frozen=True)
+class BulkInviteCampaignIssueResult:
+    campaign: BulkInviteCampaign
     token: str
 
 
@@ -252,6 +264,127 @@ def issue_invite(
     return InviteIssueResult(invite=row, token=tok.raw)
 
 
+
+def bulk_invite_campaign_state(campaign: BulkInviteCampaign, *, now: datetime | None = None) -> str:
+    point = now or utcnow()
+    if campaign.revoked_at is not None:
+        return "revoked"
+    if campaign.expires_at <= point:
+        return "expired"
+    if int(campaign.used_count) >= int(campaign.max_registrations):
+        return "full"
+    return "active"
+
+
+def issue_bulk_invite_campaign(
+    db: Session,
+    *,
+    label: str,
+    plan_id: uuid.UUID,
+    max_registrations: int,
+    trial_days: int,
+    expires_at: datetime,
+    request_id: str | None = None,
+) -> BulkInviteCampaignIssueResult:
+    clean_label = str(label or "").strip()
+    if not clean_label or len(clean_label) > 160:
+        raise BulkInviteRejected("bulk invite label is invalid")
+    if int(max_registrations) < 1:
+        raise BulkInviteRejected("bulk invite capacity is invalid")
+    if int(trial_days) < 1:
+        raise BulkInviteRejected("bulk invite trial is invalid")
+    now = utcnow()
+    if expires_at.tzinfo is None or expires_at <= now:
+        raise BulkInviteRejected("bulk invite expiry is invalid")
+    plan = db.get(Plan, plan_id)
+    if plan is None or not plan.active:
+        raise BulkInviteRejected("bulk invite plan is unavailable")
+    offer = active_offer_for_plan(db, plan_id=plan.id)
+    if offer is None:
+        raise BulkInviteRejected("bulk invite requires a commercial plan")
+    if int(offer.base_slot_quantity) != 1:
+        raise BulkInviteRejected("bulk invite requires one base configuration")
+    if int(plan.default_wireguard_limit) != int(offer.base_slot_quantity) or int(plan.default_amneziawg_limit) != int(offer.base_slot_quantity):
+        raise BulkInviteRejected("commercial plan configuration limit drift")
+    tok = secret_token()
+    row = BulkInviteCampaign(
+        id=uuid.uuid4(),
+        token_hash=tok.digest,
+        label=clean_label,
+        plan_id=plan.id,
+        max_registrations=int(max_registrations),
+        used_count=0,
+        trial_days=int(trial_days),
+        expires_at=expires_at,
+        revoked_at=None,
+        created_at=now,
+    )
+    db.add(row)
+    db.flush()
+    record_audit_event(
+        db,
+        event_type="auth.bulk_invite.issued",
+        actor_kind="admin",
+        object_type="bulk_invite_campaign",
+        object_id=str(row.id),
+        request_id=request_id_or_new(request_id),
+        payload={
+            "label": clean_label,
+            "plan_id": str(plan.id),
+            "max_registrations": int(max_registrations),
+            "trial_days": int(trial_days),
+            "expires_at": expires_at.isoformat(),
+        },
+    )
+    return BulkInviteCampaignIssueResult(campaign=row, token=tok.raw)
+
+
+def inspect_bulk_invite_campaign(db: Session, *, token: str) -> BulkInviteCampaign:
+    digest = _sha256_text(str(token or ""))
+    row = db.execute(
+        select(BulkInviteCampaign).where(BulkInviteCampaign.token_hash == digest)
+    ).scalar_one_or_none()
+    if row is None:
+        raise BulkInviteRejected("invalid bulk invite")
+    return row
+
+
+def revoke_bulk_invite_campaign(
+    db: Session,
+    *,
+    campaign_id: uuid.UUID,
+    request_id: str | None = None,
+) -> BulkInviteCampaign:
+    row = db.execute(
+        select(BulkInviteCampaign).where(BulkInviteCampaign.id == campaign_id).with_for_update()
+    ).scalar_one_or_none()
+    if row is None:
+        raise BulkInviteRejected("bulk invite not found")
+    if row.revoked_at is None:
+        row.revoked_at = utcnow()
+        record_audit_event(
+            db,
+            event_type="auth.bulk_invite.revoked",
+            actor_kind="admin",
+            object_type="bulk_invite_campaign",
+            object_id=str(row.id),
+            request_id=request_id_or_new(request_id),
+            payload={"used_count": int(row.used_count), "max_registrations": int(row.max_registrations)},
+        )
+    return row
+
+
+def _bulk_campaign_for_child(db: Session, *, invite: Invite, now: datetime) -> BulkInviteCampaign | None:
+    if invite.bulk_campaign_id is None:
+        return None
+    campaign = db.get(BulkInviteCampaign, invite.bulk_campaign_id)
+    if campaign is None or campaign.plan_id != invite.plan_id:
+        raise InviteRejected("invalid invite")
+    if bulk_invite_campaign_state(campaign, now=now) != "active":
+        raise InviteRejected("invalid invite")
+    return campaign
+
+
 def _invite_by_token(
     db: Session,
     *,
@@ -277,6 +410,7 @@ def _assert_invite_active(db: Session, *, invite: Invite, now: datetime) -> Plan
         raise InviteRejected("invalid invite")
     if invite.plan_id is None:
         raise InviteRejected("invalid invite")
+    _bulk_campaign_for_child(db, invite=invite, now=now)
     plan = db.get(Plan, invite.plan_id)
     if plan is None or not plan.active:
         raise InviteRejected("invalid invite")
@@ -553,26 +687,19 @@ def _existing_user_login_for_invite(
     )
 
 
-def request_invite_registration(
+def _request_invite_registration_for_row(
     db: Session,
     *,
-    token: str,
+    invite: Invite,
     email: str,
     ttl_seconds: int,
     request_id: str | None = None,
 ) -> MagicLinkIssueResult:
-    """Start registration, with safe idempotence for accidental repeat submits.
-
-    The invite row is the serialization point. A normal second submit for the
-    same pending email reuses the already-live registration link and therefore
-    neither invalidates it nor sends another message. Changing an already-pinned
-    pending email requires the explicit change-email operation below.
-    """
+    """Run the accepted one-recipient registration state machine for a locked Invite row."""
     if ttl_seconds < 60:
         raise AuthV2Error("magic-link ttl is too short")
     normalized = normalize_email(email)
     now = utcnow()
-    invite = _invite_by_token(db, token=token, lock=True)
     _assert_invite_active(db, invite=invite, now=now)
     if invite.intended_email and normalize_email(invite.intended_email) != normalized:
         raise InviteRejected("invalid invite")
@@ -611,9 +738,6 @@ def request_invite_registration(
             )
             return MagicLinkIssueResult(row=None, token=None)
     else:
-        # Legacy pre-0009 invites may already have a live registration token but
-        # no pending_email column value. Adopt that sole current recipient on the
-        # first post-upgrade interaction instead of invalidating a valid link.
         if live is not None:
             if normalize_email(live.email) != normalized:
                 raise InviteRejected("pending email differs; use explicit change-email")
@@ -634,8 +758,6 @@ def request_invite_registration(
             return MagicLinkIssueResult(row=None, token=None)
         invite.pending_email = normalized
 
-    # No live token exists. Close any stale unconsumed historical rows before
-    # issuing the sole current registration link.
     invalidate_registration_tokens(
         db,
         invite=invite,
@@ -648,6 +770,120 @@ def request_invite_registration(
         invite=invite,
         normalized_email=normalized,
         now=now,
+        ttl_seconds=ttl_seconds,
+        request_id=req,
+    )
+
+
+def request_invite_registration(
+    db: Session,
+    *,
+    token: str,
+    email: str,
+    ttl_seconds: int,
+    request_id: str | None = None,
+) -> MagicLinkIssueResult:
+    if ttl_seconds < 60:
+        raise AuthV2Error("magic-link ttl is too short")
+    invite = _invite_by_token(db, token=token, lock=True)
+    return _request_invite_registration_for_row(
+        db,
+        invite=invite,
+        email=email,
+        ttl_seconds=ttl_seconds,
+        request_id=request_id,
+    )
+
+
+def request_bulk_invite_registration(
+    db: Session,
+    *,
+    campaign_token: str,
+    email: str,
+    ttl_seconds: int,
+    request_id: str | None = None,
+) -> MagicLinkIssueResult:
+    if ttl_seconds < 60:
+        raise AuthV2Error("magic-link ttl is too short")
+    normalized = normalize_email(email)
+    now = utcnow()
+    campaign = inspect_bulk_invite_campaign(db, token=campaign_token)
+    if bulk_invite_campaign_state(campaign, now=now) != "active":
+        raise BulkInviteRejected("bulk invite unavailable")
+    req = request_id_or_new(request_id)
+
+    existing_user = db.execute(select(User).where(User.email == normalized)).scalar_one_or_none()
+    if existing_user is not None:
+        record_audit_event(
+            db,
+            event_type="auth.bulk_invite.existing_user_login",
+            actor_kind="anonymous",
+            object_type="bulk_invite_campaign",
+            object_id=str(campaign.id),
+            request_id=req,
+            payload={"email_hash": email_fingerprint(normalized)},
+        )
+        return issue_magic_link_for_email(
+            db,
+            email=normalized,
+            ttl_seconds=ttl_seconds,
+            request_id=req,
+        )
+
+    offer = active_offer_for_plan(db, plan_id=campaign.plan_id)
+    plan = db.get(Plan, campaign.plan_id)
+    if plan is None or not plan.active or offer is None:
+        raise BulkInviteRejected("bulk invite unavailable")
+    child_token = secret_token()
+    child_id = uuid.uuid4()
+    insert_stmt = (
+        pg_insert(Invite)
+        .values(
+            id=child_id,
+            token_hash=child_token.digest,
+            created_by_user_id=None,
+            created_by_kind="system",
+            created_by_label=campaign.label,
+            intended_email=normalized,
+            pending_email=None,
+            wireguard_profile_limit=int(offer.base_slot_quantity),
+            plan_id=campaign.plan_id,
+            bulk_campaign_id=campaign.id,
+            max_uses=1,
+            used_count=0,
+            expires_at=campaign.expires_at,
+            revoked_at=None,
+            created_at=now,
+        )
+        .on_conflict_do_nothing(index_elements=[Invite.bulk_campaign_id, Invite.intended_email])
+        .returning(Invite.id)
+    )
+    inserted_id = db.execute(insert_stmt).scalar_one_or_none()
+    invite = db.execute(
+        select(Invite)
+        .where(Invite.bulk_campaign_id == campaign.id, Invite.intended_email == normalized)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if invite is None:
+        raise BulkInviteRejected("bulk invite child creation failed")
+    if inserted_id is not None:
+        record_audit_event(
+            db,
+            event_type="auth.bulk_invite.child_created",
+            actor_kind="system",
+            object_type="invite",
+            object_id=str(invite.id),
+            request_id=req,
+            payload={
+                "bulk_campaign_id": str(campaign.id),
+                "email_hash": email_fingerprint(normalized),
+                "plan_id": str(campaign.plan_id),
+            },
+        )
+    return _request_invite_registration_for_row(
+        db,
+        invite=invite,
+        email=normalized,
         ttl_seconds=ttl_seconds,
         request_id=req,
     )
@@ -782,6 +1018,8 @@ def admin_replace_invite_email(
         raise InviteRejected("invalid invite")
     if invite.created_by_kind == "user":
         raise InviteRejected("user referral invite is not admin-mutable")
+    if invite.bulk_campaign_id is not None:
+        raise InviteRejected("bulk child invite is not admin-mutable")
     _assert_invite_active(db, invite=invite, now=now)
     req = request_id_or_new(request_id)
     normalized = normalize_email(email) if email else None
@@ -861,6 +1099,8 @@ def admin_reissue_transferable_invite_token(
         raise InviteRejected("invalid invite")
     if invite.created_by_kind == "user":
         raise InviteRejected("user referral invite is not admin-mutable")
+    if invite.bulk_campaign_id is not None:
+        raise InviteRejected("bulk child invite is not admin-mutable")
     _assert_invite_active(db, invite=invite, now=now)
     live_registration = _live_registration_token(
         db,
@@ -982,6 +1222,8 @@ def admin_resend_invite_registration(
         raise InviteRejected("invalid invite")
     if invite.created_by_kind == "user":
         raise InviteRejected("user referral invite is not admin-mutable")
+    if invite.bulk_campaign_id is not None:
+        raise InviteRejected("bulk child invite is not admin-mutable")
     _assert_invite_active(db, invite=invite, now=now)
     req = request_id_or_new(request_id)
     latest = _latest_registration_token(db, invite_id=invite.id, lock=True)
@@ -1106,6 +1348,42 @@ def _issue_session_for_user(
     return SessionIssueResult(session=session, token=tok.raw)
 
 
+
+def _claim_bulk_invite_capacity(
+    db: Session,
+    *,
+    invite: Invite,
+    now: datetime,
+    request_id: str,
+) -> bool:
+    if invite.bulk_campaign_id is None:
+        return False
+    stmt = (
+        update(BulkInviteCampaign)
+        .where(
+            BulkInviteCampaign.id == invite.bulk_campaign_id,
+            BulkInviteCampaign.revoked_at.is_(None),
+            BulkInviteCampaign.expires_at > now,
+            BulkInviteCampaign.used_count < BulkInviteCampaign.max_registrations,
+        )
+        .values(used_count=BulkInviteCampaign.used_count + 1)
+        .returning(BulkInviteCampaign.used_count)
+    )
+    new_used_count = db.execute(stmt).scalar_one_or_none()
+    if new_used_count is None:
+        raise MagicLinkRejected("invalid magic link")
+    record_audit_event(
+        db,
+        event_type="auth.bulk_invite.capacity_claimed",
+        actor_kind="system",
+        object_type="bulk_invite_campaign",
+        object_id=str(invite.bulk_campaign_id),
+        request_id=request_id,
+        payload={"invite_id": str(invite.id), "used_count": int(new_used_count)},
+    )
+    return True
+
+
 def consume_magic_link(
     db: Session,
     *,
@@ -1157,6 +1435,12 @@ def consume_magic_link(
         if db.execute(select(User).where(User.email == normalized)).scalar_one_or_none() is not None:
             raise MagicLinkRejected("invalid magic link")
 
+        bulk_capacity_claimed = _claim_bulk_invite_capacity(
+            db,
+            invite=invite,
+            now=now,
+            request_id=req,
+        )
         user = ensure_verified_user(db, normalized, verified_at=now)
         redemption = InviteRedemption(
             id=uuid.uuid4(),
@@ -1183,6 +1467,7 @@ def consume_magic_link(
                         wg_node_id=wg_node_id,
                         now=now,
                         request_id=req,
+                        bulk_capacity_claimed=bulk_capacity_claimed,
                     )
                 except CommercialRegistrationRejected as exc:
                     raise MagicLinkRejected("invalid magic link") from exc
@@ -1246,7 +1531,10 @@ def consume_magic_link(
             object_type="invite",
             object_id=str(invite.id),
             request_id=req,
-            payload={"email_hash": email_fingerprint(normalized)},
+            payload={
+                "email_hash": email_fingerprint(normalized),
+                "bulk_campaign_id": str(invite.bulk_campaign_id) if invite.bulk_campaign_id else None,
+            },
         )
         record_audit_event(
             db,
@@ -1259,6 +1547,7 @@ def consume_magic_link(
             payload={
                 "grant_created": grant is not None,
                 "wireguard_profile_limit": effective_wg_limit,
+                "bulk_campaign_id": str(invite.bulk_campaign_id) if invite.bulk_campaign_id else None,
             },
         )
     else:

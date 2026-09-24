@@ -12,6 +12,7 @@ from app.models import (
     BillingAccount,
     BillingOffer,
     BillingPayment,
+    BulkInviteCampaign,
     Invite,
     Plan,
     User,
@@ -223,6 +224,16 @@ def commercial_invite_is_effective(
         return False
     if int(invite.wireguard_profile_limit or -1) != int(offer.base_slot_quantity):
         return False
+    if invite.bulk_campaign_id is not None:
+        campaign = db.get(BulkInviteCampaign, invite.bulk_campaign_id)
+        return (
+            campaign is not None
+            and campaign.plan_id == invite.plan_id
+            and invite.created_by_kind == "system"
+            and invite.created_by_user_id is None
+            and invite.intended_email is not None
+            and int(invite.max_uses) == 1
+        )
     if invite.created_by_kind == "user":
         if invite.created_by_user_id is None:
             return False
@@ -259,6 +270,7 @@ def create_commercial_trial_registration(
     wg_node_id: str,
     now: datetime | None = None,
     request_id: str | None = None,
+    bulk_capacity_claimed: bool = False,
 ) -> TrialRegistrationResult:
     point = now or utcnow()
     if invite.plan_id is None:
@@ -280,7 +292,22 @@ def create_commercial_trial_registration(
     if int(plan.default_wireguard_limit) != 1 or int(plan.default_amneziawg_limit) != 1:
         raise CommercialRegistrationRejected("commercial plan configuration limit drift")
 
-    period_end = point + timedelta(days=int(offer.trial_days))
+    campaign = None
+    if invite.bulk_campaign_id is not None:
+        if not bulk_capacity_claimed:
+            raise CommercialRegistrationRejected("bulk invite capacity was not claimed")
+        campaign = db.get(BulkInviteCampaign, invite.bulk_campaign_id)
+        if campaign is None or campaign.plan_id != invite.plan_id:
+            raise CommercialRegistrationRejected("bulk invite campaign is unavailable")
+        effective_trial_days = int(campaign.trial_days)
+    else:
+        if bulk_capacity_claimed:
+            raise CommercialRegistrationRejected("unexpected bulk capacity claim")
+        effective_trial_days = int(offer.trial_days)
+    if effective_trial_days < 1:
+        raise CommercialRegistrationRejected("commercial trial duration is invalid")
+
+    period_end = point + timedelta(days=effective_trial_days)
     grant = create_grant_from_plan(
         db,
         user=user,
@@ -343,10 +370,11 @@ def create_commercial_trial_registration(
         request_id=request_id,
         payload={
             "offer_code": offer.code,
-            "trial_days": int(offer.trial_days),
+            "trial_days": effective_trial_days,
             "slot_quantity": 1,
             "invite_id": str(invite.id),
-            "inviter_user_id": str(invite.created_by_user_id),
+            "inviter_user_id": str(invite.created_by_user_id) if invite.created_by_user_id else None,
+            "bulk_campaign_id": str(invite.bulk_campaign_id) if invite.bulk_campaign_id else None,
         },
     )
     return TrialRegistrationResult(account=account, grant=grant, configuration=configuration)
