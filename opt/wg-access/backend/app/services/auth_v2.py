@@ -85,6 +85,16 @@ class MagicLinkIssueResult:
 
 
 @dataclass(frozen=True)
+class ExpiredRegistrationMagicLink:
+    row: MagicLinkToken
+    invite: Invite
+    email: str
+    resend_available_at: datetime | None
+    can_resend: bool
+    ttl_seconds: int
+
+
+@dataclass(frozen=True)
 class SessionIssueResult:
     session: AuthSession
     token: str
@@ -307,6 +317,114 @@ def _latest_registration_token(
 
 def latest_registration_token(db: Session, *, invite_id: uuid.UUID) -> MagicLinkToken | None:
     return _latest_registration_token(db, invite_id=invite_id, lock=False)
+
+
+def inspect_expired_registration_magic_link(
+    db: Session,
+    *,
+    token: str,
+    cooldown_seconds: int,
+    lock: bool = False,
+) -> ExpiredRegistrationMagicLink:
+    if cooldown_seconds < 0:
+        raise AuthV2Error("invalid registration resend settings")
+    now = utcnow()
+    digest = _sha256_text(str(token or ""))
+    query = select(MagicLinkToken).where(MagicLinkToken.token_hash == digest)
+    if lock:
+        query = query.with_for_update()
+    row = db.execute(query).scalar_one_or_none()
+    if (
+        row is None
+        or row.purpose != "registration"
+        or row.user_id is not None
+        or row.invite_id is None
+        or row.consumed_at is not None
+        or row.expires_at > now
+    ):
+        raise MagicLinkRejected("expired registration magic link unavailable")
+
+    invite_query = select(Invite).where(Invite.id == row.invite_id)
+    if lock:
+        invite_query = invite_query.with_for_update()
+    invite = db.execute(invite_query).scalar_one_or_none()
+    if invite is None:
+        raise MagicLinkRejected("expired registration magic link unavailable")
+    try:
+        _assert_invite_active(db, invite=invite, now=now)
+    except InviteRejected as exc:
+        raise MagicLinkRejected("expired registration magic link unavailable") from exc
+
+    if not invite.pending_email:
+        raise MagicLinkRejected("expired registration magic link unavailable")
+    normalized = normalize_email(invite.pending_email)
+    if normalize_email(row.email) != normalized:
+        raise MagicLinkRejected("expired registration magic link unavailable")
+    if invite.intended_email and normalize_email(invite.intended_email) != normalized:
+        raise MagicLinkRejected("expired registration magic link unavailable")
+
+    latest = _latest_registration_token(db, invite_id=invite.id, lock=lock)
+    if latest is None or latest.id != row.id:
+        # An old superseded email must never be able to churn or reveal the
+        # recipient of a newer registration attempt.
+        raise MagicLinkRejected("expired registration magic link unavailable")
+
+    resend_available_at = None
+    if cooldown_seconds:
+        resend_available_at = latest.created_at + timedelta(seconds=cooldown_seconds)
+    ttl_seconds = max(60, int((row.expires_at - row.created_at).total_seconds()))
+    return ExpiredRegistrationMagicLink(
+        row=row,
+        invite=invite,
+        email=normalized,
+        resend_available_at=resend_available_at,
+        can_resend=(resend_available_at is None or resend_available_at <= now),
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def resend_expired_registration_magic_link(
+    db: Session,
+    *,
+    token: str,
+    ttl_seconds: int,
+    cooldown_seconds: int,
+    request_id: str | None = None,
+) -> MagicLinkIssueResult:
+    if ttl_seconds < 60 or cooldown_seconds < 0:
+        raise AuthV2Error("invalid registration resend settings")
+    context = inspect_expired_registration_magic_link(
+        db,
+        token=token,
+        cooldown_seconds=cooldown_seconds,
+        lock=True,
+    )
+    now = utcnow()
+    if not context.can_resend and context.resend_available_at is not None:
+        remaining = int((context.resend_available_at - now).total_seconds())
+        if context.resend_available_at > now + timedelta(seconds=remaining):
+            remaining += 1
+        raise InviteResendTooSoon(remaining)
+
+    req = request_id_or_new(request_id)
+    existing_login = _existing_user_login_for_invite(
+        db,
+        invite=context.invite,
+        normalized_email=context.email,
+        ttl_seconds=ttl_seconds,
+        request_id=req,
+    )
+    if existing_login is not None:
+        return existing_login
+
+    return _issue_registration_token(
+        db,
+        invite=context.invite,
+        normalized_email=context.email,
+        now=now,
+        ttl_seconds=ttl_seconds,
+        request_id=req,
+    )
 
 
 def _live_registration_token(

@@ -52,12 +52,14 @@ from app.services.auth_v2 import (
     email_fingerprint,
     enforce_rate_limit,
     issue_invite,
+    inspect_expired_registration_magic_link,
     inspect_invite,
     invalidate_registration_tokens,
     issue_magic_link_for_email,
     latest_registration_token,
     request_invite_registration,
     request_id_or_new,
+    resend_expired_registration_magic_link,
     resend_invite_registration,
     revoke_session,
     user_reissue_referral_invite_token,
@@ -195,7 +197,14 @@ def _mask_email(value: str | None) -> str | None:
     local, domain = text_value.rsplit("@", 1)
     if not local or not domain:
         return None
-    return f"{local[:1]}***@{domain}"
+    domain_head = domain.split(".", 1)[0]
+    if not domain_head:
+        return None
+    suffix = domain.rsplit(".", 1)[1] if "." in domain and domain.rsplit(".", 1)[1] else ""
+    masked_domain = f"{domain_head[:1]}***"
+    if suffix:
+        masked_domain = f"{masked_domain}.{suffix}"
+    return f"{local[:1]}***@{masked_domain}"
 
 
 def _invite_lifecycle_state(invite: Invite, *, now: datetime | None = None) -> str:
@@ -791,6 +800,116 @@ def login_request(
             payload={"email_hash": email_fingerprint(payload.email)},
         )
         db.commit()
+    return GENERIC_LOGIN_RESPONSE
+
+
+class MagicLinkRecoveryRequest(BaseModel):
+    token: str
+
+
+class MagicLinkRecoveryResponse(BaseModel):
+    state: Literal["expired_registration"]
+    pending_email_masked: str
+    resend_available_at: datetime | None
+    can_resend: bool
+    magic_link_ttl_seconds: int
+
+
+@router.post("/auth/magic-link/recovery", response_model=MagicLinkRecoveryResponse)
+def inspect_magic_link_recovery_route(
+    payload: MagicLinkRecoveryRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    req = _request_id(request)
+    try:
+        enforce_rate_limit(
+            db,
+            scope="magic_recovery_inspect",
+            subject=f"{_client_key(request)}|{payload.token[:16]}",
+            limit=settings.auth_magic_consume_rate_limit,
+            window_seconds=settings.auth_rate_window_seconds,
+            request_id=req,
+        )
+        db.commit()
+    except RateLimitExceeded as exc:
+        db.commit()
+        raise HTTPException(status_code=429, detail="too many requests") from exc
+
+    try:
+        recovery = inspect_expired_registration_magic_link(
+            db,
+            token=payload.token,
+            cooldown_seconds=settings.auth_registration_resend_cooldown_seconds,
+        )
+    except (MagicLinkRejected, InviteRejected, InvalidIdentity) as exc:
+        raise HTTPException(status_code=404, detail="recovery unavailable") from exc
+    masked = _mask_email(recovery.email)
+    if masked is None:
+        raise HTTPException(status_code=404, detail="recovery unavailable")
+    return MagicLinkRecoveryResponse(
+        state="expired_registration",
+        pending_email_masked=masked,
+        resend_available_at=recovery.resend_available_at,
+        can_resend=recovery.can_resend,
+        magic_link_ttl_seconds=recovery.ttl_seconds,
+    )
+
+
+@router.post("/auth/magic-link/resend", status_code=status.HTTP_202_ACCEPTED)
+def resend_expired_magic_link_route(
+    payload: MagicLinkRecoveryRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+):
+    req = _request_id(request)
+    try:
+        enforce_rate_limit(
+            db,
+            scope="magic_recovery_resend",
+            subject=f"{_client_key(request)}|{payload.token[:16]}",
+            limit=settings.auth_redeem_rate_limit,
+            window_seconds=settings.auth_rate_window_seconds,
+            request_id=req,
+        )
+        db.commit()
+    except RateLimitExceeded as exc:
+        db.commit()
+        raise HTTPException(status_code=429, detail="too many requests") from exc
+
+    try:
+        result = resend_expired_registration_magic_link(
+            db,
+            token=payload.token,
+            ttl_seconds=settings.auth_magic_link_ttl_seconds,
+            cooldown_seconds=settings.auth_registration_resend_cooldown_seconds,
+            request_id=req,
+        )
+        delivered = _deliver_magic_link_result(db, result=result, request_id=req)
+        if delivered and result.row is not None and result.row.purpose == "registration" and result.row.invite_id is not None:
+            invite = db.get(Invite, result.row.invite_id)
+            if invite is not None:
+                invalidate_registration_tokens(
+                    db,
+                    invite=invite,
+                    now=utcnow(),
+                    request_id=req,
+                    reason="expired_magic_link_self_service_resend",
+                    keep_token_id=result.row.id,
+                )
+        db.commit()
+    except InviteResendTooSoon as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=429,
+            detail="resend cooldown",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+    except (MagicLinkRejected, InviteRejected, InvalidIdentity) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="recovery unavailable") from exc
     return GENERIC_LOGIN_RESPONSE
 
 
