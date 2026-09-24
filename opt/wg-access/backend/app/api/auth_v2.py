@@ -10,7 +10,7 @@ import time
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
@@ -2156,6 +2156,9 @@ class AdminPlanSummary(BaseModel):
 
 class AdminInviteSummary(BaseModel):
     invite_id: UUID
+    origin: Literal["user", "admin", "campaign"]
+    bulk_campaign_id: UUID | None
+    bulk_campaign_label: str | None
     intended_email: str | None
     pending_email: str | None
     plan_id: UUID | None
@@ -2318,6 +2321,15 @@ class AdminConfigurationCreateResponse(BaseModel):
 def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None = None) -> AdminInviteSummary:
     point = now or utcnow()
     state = _invite_lifecycle_state(invite, now=point)
+    campaign = db.get(BulkInviteCampaign, invite.bulk_campaign_id) if invite.bulk_campaign_id is not None else None
+    origin: Literal["user", "admin", "campaign"]
+    if invite.bulk_campaign_id is not None:
+        origin = "campaign"
+    elif invite.created_by_kind == "user":
+        origin = "user"
+    else:
+        origin = "admin"
+    admin_mutable = invite.bulk_campaign_id is None
     latest = latest_registration_token(db, invite_id=invite.id)
     live = (
         latest
@@ -2340,6 +2352,9 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
     )
     return AdminInviteSummary(
         invite_id=invite.id,
+        origin=origin,
+        bulk_campaign_id=invite.bulk_campaign_id,
+        bulk_campaign_label=campaign.label if campaign is not None else None,
         intended_email=invite.intended_email,
         pending_email=effective_pending_email,
         plan_id=invite.plan_id,
@@ -2357,17 +2372,19 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
         magic_link_expires_at=live.expires_at if live is not None else None,
         resend_available_at=resend_available_at,
         can_resend=(
-            state == "awaiting_confirmation"
+            admin_mutable
+            and state == "awaiting_confirmation"
             and effective_pending_email is not None
             and (resend_available_at is None or resend_available_at <= point)
         ),
-        can_change_email=(state in {"active", "awaiting_confirmation"}),
+        can_change_email=(admin_mutable and state in {"active", "awaiting_confirmation"}),
         can_reissue_share_link=(
-            state == "active"
+            admin_mutable
+            and state == "active"
             and invite.intended_email is None
             and effective_pending_email is None
         ),
-        can_revoke=(state in {"active", "awaiting_confirmation"}),
+        can_revoke=(admin_mutable and state in {"active", "awaiting_confirmation"}),
     )
 
 
@@ -2528,10 +2545,29 @@ def admin_revoke_bulk_invite(
     response_model=list[AdminInviteSummary],
     dependencies=[Depends(_require_admin)],
 )
-def admin_list_invites(db: Session = Depends(get_db)):
+def admin_list_invites(
+    origin: list[Literal["user", "admin", "campaign"]] | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    requested = set(origin or ("user", "admin"))
+    predicates = []
+    if "user" in requested:
+        predicates.append(
+            and_(Invite.bulk_campaign_id.is_(None), Invite.created_by_kind == "user")
+        )
+    if "admin" in requested:
+        predicates.append(
+            and_(Invite.bulk_campaign_id.is_(None), Invite.created_by_kind == "admin")
+        )
+    if "campaign" in requested:
+        predicates.append(Invite.bulk_campaign_id.is_not(None))
+
+    if not predicates:
+        return []
+
     rows = db.execute(
         select(Invite)
-        .where(Invite.bulk_campaign_id.is_(None))
+        .where(or_(*predicates))
         .order_by(Invite.created_at.desc())
     ).scalars().all()
     point = utcnow()
