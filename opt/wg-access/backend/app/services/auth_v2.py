@@ -107,10 +107,26 @@ class ExpiredRegistrationMagicLink:
 
 
 @dataclass(frozen=True)
+class BulkInviteCapacityClaim:
+    claimed: bool
+    campaign_id: uuid.UUID | None = None
+    became_full: bool = False
+
+
+@dataclass(frozen=True)
+class BulkInviteChildCleanupResult:
+    campaign_id: uuid.UUID
+    campaign_state: str
+    revoked_invites: int
+    invalidated_tokens: int
+
+
+@dataclass(frozen=True)
 class SessionIssueResult:
     session: AuthSession
     token: str
     agent_wakeup_needed: bool = False
+    bulk_campaign_cleanup_id: uuid.UUID | None = None
 
 
 def _sha256_text(value: str) -> str:
@@ -362,11 +378,19 @@ def issue_bulk_invite_campaign(
     return BulkInviteCampaignIssueResult(campaign=row, token=tok.raw)
 
 
-def inspect_bulk_invite_campaign(db: Session, *, token: str) -> BulkInviteCampaign:
+def inspect_bulk_invite_campaign(
+    db: Session,
+    *,
+    token: str,
+    shared_lock: bool = False,
+) -> BulkInviteCampaign:
     digest = _sha256_text(str(token or ""))
-    row = db.execute(
-        select(BulkInviteCampaign).where(BulkInviteCampaign.token_hash == digest)
-    ).scalar_one_or_none()
+    query = select(BulkInviteCampaign).where(BulkInviteCampaign.token_hash == digest)
+    if shared_lock:
+        # Concurrent email requests may share this lock, while campaign revoke
+        # and successful capacity claims cannot overtake child creation.
+        query = query.with_for_update(read=True)
+    row = db.execute(query).scalar_one_or_none()
     if row is None:
         raise BulkInviteRejected("invalid bulk invite")
     return row
@@ -642,6 +666,110 @@ def invalidate_registration_tokens(
     return len(rows)
 
 
+def terminalize_terminal_bulk_campaign_children(
+    db: Session,
+    *,
+    campaign_id: uuid.UUID,
+    now: datetime | None = None,
+    request_id: str | None = None,
+    reason: str | None = None,
+) -> BulkInviteChildCleanupResult:
+    point = now or utcnow()
+    campaign = db.get(BulkInviteCampaign, campaign_id)
+    if campaign is None:
+        raise BulkInviteRejected("bulk invite not found")
+    campaign_state = bulk_invite_campaign_state(campaign, now=point)
+    if campaign_state not in {"revoked", "full"}:
+        return BulkInviteChildCleanupResult(
+            campaign_id=campaign.id,
+            campaign_state=campaign_state,
+            revoked_invites=0,
+            invalidated_tokens=0,
+        )
+
+    rows = db.execute(
+        select(Invite)
+        .where(
+            Invite.bulk_campaign_id == campaign.id,
+            Invite.revoked_at.is_(None),
+            Invite.used_count < Invite.max_uses,
+            (Invite.expires_at.is_(None) | (Invite.expires_at > point)),
+        )
+        .order_by(Invite.created_at.asc(), Invite.id.asc())
+        .with_for_update()
+    ).scalars().all()
+    req = request_id_or_new(request_id)
+    cleanup_reason = str(reason or f"bulk_campaign_{campaign_state}")[:128]
+    revoked_invites = 0
+    invalidated_tokens = 0
+    revoked_at = campaign.revoked_at if campaign_state == "revoked" and campaign.revoked_at is not None else point
+    for invite in rows:
+        invalidated_for_invite = invalidate_registration_tokens(
+            db,
+            invite=invite,
+            now=point,
+            request_id=req,
+            reason=cleanup_reason,
+        )
+        invalidated_tokens += invalidated_for_invite
+        invite.revoked_at = revoked_at
+        record_audit_event(
+            db,
+            event_type="auth.bulk_invite.child_terminalized",
+            actor_kind="system",
+            object_type="invite",
+            object_id=str(invite.id),
+            request_id=req,
+            payload={
+                "bulk_campaign_id": str(campaign.id),
+                "campaign_state": campaign_state,
+                "reason": cleanup_reason,
+                "invalidated_registration_tokens": invalidated_for_invite,
+            },
+        )
+        revoked_invites += 1
+    return BulkInviteChildCleanupResult(
+        campaign_id=campaign.id,
+        campaign_state=campaign_state,
+        revoked_invites=revoked_invites,
+        invalidated_tokens=invalidated_tokens,
+    )
+
+
+def reconcile_terminal_bulk_invite_children(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    request_id: str | None = None,
+) -> tuple[int, int, int]:
+    point = now or utcnow()
+    campaign_ids = db.execute(
+        select(BulkInviteCampaign.id)
+        .where(
+            (BulkInviteCampaign.revoked_at.is_not(None))
+            | (BulkInviteCampaign.used_count >= BulkInviteCampaign.max_registrations)
+        )
+        .order_by(BulkInviteCampaign.created_at.asc(), BulkInviteCampaign.id.asc())
+    ).scalars().all()
+    campaigns_reconciled = 0
+    revoked_invites = 0
+    invalidated_tokens = 0
+    req = request_id_or_new(request_id)
+    for campaign_id in campaign_ids:
+        result = terminalize_terminal_bulk_campaign_children(
+            db,
+            campaign_id=campaign_id,
+            now=point,
+            request_id=req,
+            reason="terminal_campaign_reconcile",
+        )
+        if result.revoked_invites:
+            campaigns_reconciled += 1
+            revoked_invites += result.revoked_invites
+            invalidated_tokens += result.invalidated_tokens
+    return campaigns_reconciled, revoked_invites, invalidated_tokens
+
+
 def _issue_registration_token(
     db: Session,
     *,
@@ -830,7 +958,7 @@ def request_bulk_invite_registration(
         raise AuthV2Error("magic-link ttl is too short")
     normalized = normalize_email(email)
     now = utcnow()
-    campaign = inspect_bulk_invite_campaign(db, token=campaign_token)
+    campaign = inspect_bulk_invite_campaign(db, token=campaign_token, shared_lock=True)
     if bulk_invite_campaign_state(campaign, now=now) != "active":
         raise BulkInviteRejected("bulk invite unavailable")
     req = request_id_or_new(request_id)
@@ -1382,9 +1510,9 @@ def _claim_bulk_invite_capacity(
     invite: Invite,
     now: datetime,
     request_id: str,
-) -> bool:
+) -> BulkInviteCapacityClaim:
     if invite.bulk_campaign_id is None:
-        return False
+        return BulkInviteCapacityClaim(claimed=False)
     stmt = (
         update(BulkInviteCampaign)
         .where(
@@ -1394,11 +1522,14 @@ def _claim_bulk_invite_capacity(
             BulkInviteCampaign.used_count < BulkInviteCampaign.max_registrations,
         )
         .values(used_count=BulkInviteCampaign.used_count + 1)
-        .returning(BulkInviteCampaign.used_count)
+        .returning(BulkInviteCampaign.used_count, BulkInviteCampaign.max_registrations)
     )
-    new_used_count = db.execute(stmt).scalar_one_or_none()
-    if new_used_count is None:
+    claimed = db.execute(stmt).one_or_none()
+    if claimed is None:
         raise MagicLinkRejected("invalid magic link")
+    new_used_count = int(claimed[0])
+    max_registrations = int(claimed[1])
+    became_full = new_used_count >= max_registrations
     record_audit_event(
         db,
         event_type="auth.bulk_invite.capacity_claimed",
@@ -1406,9 +1537,18 @@ def _claim_bulk_invite_capacity(
         object_type="bulk_invite_campaign",
         object_id=str(invite.bulk_campaign_id),
         request_id=request_id,
-        payload={"invite_id": str(invite.id), "used_count": int(new_used_count)},
+        payload={
+            "invite_id": str(invite.id),
+            "used_count": new_used_count,
+            "max_registrations": max_registrations,
+            "became_full": became_full,
+        },
     )
-    return True
+    return BulkInviteCapacityClaim(
+        claimed=True,
+        campaign_id=invite.bulk_campaign_id,
+        became_full=became_full,
+    )
 
 
 def consume_magic_link(
@@ -1431,6 +1571,7 @@ def consume_magic_link(
 
     req = request_id_or_new(request_id)
     agent_wakeup_needed = False
+    bulk_campaign_cleanup_id: uuid.UUID | None = None
 
     if row.purpose == "login":
         if row.user_id is None or row.invite_id is not None:
@@ -1462,12 +1603,14 @@ def consume_magic_link(
         if db.execute(select(User).where(User.email == normalized)).scalar_one_or_none() is not None:
             raise MagicLinkRejected("invalid magic link")
 
-        bulk_capacity_claimed = _claim_bulk_invite_capacity(
+        bulk_capacity = _claim_bulk_invite_capacity(
             db,
             invite=invite,
             now=now,
             request_id=req,
         )
+        if bulk_capacity.became_full:
+            bulk_campaign_cleanup_id = bulk_capacity.campaign_id
         user = ensure_verified_user(db, normalized, verified_at=now)
         # This registration path creates a new user only: existing users were
         # diverted to login before a registration token can be consumed.
@@ -1498,7 +1641,7 @@ def consume_magic_link(
                         wg_node_id=wg_node_id,
                         now=now,
                         request_id=req,
-                        bulk_capacity_claimed=bulk_capacity_claimed,
+                        bulk_capacity_claimed=bulk_capacity.claimed,
                     )
                 except CommercialRegistrationRejected as exc:
                     raise MagicLinkRejected("invalid magic link") from exc
@@ -1612,6 +1755,7 @@ def consume_magic_link(
         session=result.session,
         token=result.token,
         agent_wakeup_needed=agent_wakeup_needed,
+        bulk_campaign_cleanup_id=bulk_campaign_cleanup_id,
     )
 
 def authenticate_session(db: Session, *, token: str) -> tuple[AuthSession, User]:

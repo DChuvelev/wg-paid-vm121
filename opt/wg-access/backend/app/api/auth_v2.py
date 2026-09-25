@@ -69,6 +69,7 @@ from app.services.auth_v2 import (
     resend_invite_registration,
     revoke_bulk_invite_campaign,
     revoke_session,
+    terminalize_terminal_bulk_campaign_children,
     user_reissue_referral_invite_token,
     user_revoke_referral_invite,
 )
@@ -1036,6 +1037,27 @@ def consume_magic_link_route(
             request_id=req,
         )
         db.commit()
+        if result.bulk_campaign_cleanup_id is not None:
+            try:
+                cleanup = terminalize_terminal_bulk_campaign_children(
+                    db,
+                    campaign_id=result.bulk_campaign_cleanup_id,
+                    request_id=req,
+                    reason="campaign_full",
+                )
+                db.commit()
+                logger.info(
+                    "bulk campaign full child cleanup campaign=%s invites=%s tokens=%s",
+                    cleanup.campaign_id,
+                    cleanup.revoked_invites,
+                    cleanup.invalidated_tokens,
+                )
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "bulk campaign full child cleanup failed campaign=%s",
+                    result.bulk_campaign_cleanup_id,
+                )
         if result.agent_wakeup_needed:
             trigger_wg_access_agent_best_effort()
     except MagicLinkRejected as exc:
@@ -2355,8 +2377,18 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
     effective_pending_email = invite.pending_email or (live.email if live is not None else None)
     if state == "active" and effective_pending_email is not None:
         state = "awaiting_confirmation"
+
+    if campaign is not None and invite.used_count < invite.max_uses and state in {"active", "awaiting_confirmation"}:
+        parent_state = bulk_invite_campaign_state(campaign, now=point)
+        if parent_state in {"revoked", "full"}:
+            state = "revoked"
+        elif parent_state == "expired":
+            state = "expired"
+    if state not in {"active", "awaiting_confirmation"}:
+        live = None
+
     resend_available_at = None
-    if effective_pending_email and latest is not None:
+    if state == "awaiting_confirmation" and effective_pending_email and latest is not None:
         resend_available_at = latest.created_at + timedelta(
             seconds=settings.auth_registration_resend_cooldown_seconds
         )
@@ -2548,17 +2580,37 @@ def admin_revoke_bulk_invite(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    req = _request_id(request)
     try:
         campaign = revoke_bulk_invite_campaign(
             db,
             campaign_id=campaign_id,
-            request_id=_request_id(request),
+            request_id=req,
         )
         db.commit()
         db.refresh(campaign)
     except BulkInviteRejected as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail="bulk invite not found") from exc
+
+    try:
+        cleanup = terminalize_terminal_bulk_campaign_children(
+            db,
+            campaign_id=campaign_id,
+            request_id=req,
+            reason="campaign_revoked",
+        )
+        db.commit()
+        logger.info(
+            "bulk campaign revoke child cleanup campaign=%s invites=%s tokens=%s",
+            cleanup.campaign_id,
+            cleanup.revoked_invites,
+            cleanup.invalidated_tokens,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("bulk campaign revoke child cleanup failed campaign=%s", campaign_id)
+    campaign = db.get(BulkInviteCampaign, campaign_id) or campaign
     return _admin_bulk_invite_summary(campaign, now=utcnow())
 
 
