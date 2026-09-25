@@ -483,6 +483,8 @@ class AdminInviteRequest(BaseModel):
     intended_email: EmailStr | None = None
     plan_id: UUID
     wireguard_profile_limit: int | None = Field(default=None, ge=0)
+    recipient_referrals_enabled: bool = True
+    recipient_referral_limit: int = Field(default=3, ge=0)
 
 
 class AdminInviteResponse(BaseModel):
@@ -491,6 +493,8 @@ class AdminInviteResponse(BaseModel):
     expires_at: datetime | None
     intended_email: str | None
     wireguard_profile_limit: int
+    recipient_referrals_enabled: bool
+    recipient_referral_limit: int
     email_sent: bool
 
 
@@ -514,6 +518,8 @@ def admin_create_invite(
             ttl_seconds=settings.auth_invite_ttl_seconds,
             plan_id=payload.plan_id,
             wireguard_profile_limit=payload.wireguard_profile_limit,
+            recipient_referrals_enabled=payload.recipient_referrals_enabled,
+            recipient_referral_limit=payload.recipient_referral_limit,
             created_by_kind="admin",
             created_by_user_id=None,
             created_by_label="Admin",
@@ -539,6 +545,8 @@ def admin_create_invite(
         expires_at=result.invite.expires_at,
         intended_email=result.invite.intended_email,
         wireguard_profile_limit=result.invite.wireguard_profile_limit,
+        recipient_referrals_enabled=bool(result.invite.recipient_referrals_enabled),
+        recipient_referral_limit=int(result.invite.recipient_referral_limit),
         email_sent=email_sent,
     )
 
@@ -2163,6 +2171,8 @@ class AdminInviteSummary(BaseModel):
     pending_email: str | None
     plan_id: UUID | None
     wireguard_profile_limit: int
+    recipient_referrals_enabled: bool
+    recipient_referral_limit: int
     max_uses: int
     used_count: int
     expires_at: datetime | None
@@ -2188,6 +2198,8 @@ class AdminBulkInviteSummary(BaseModel):
     max_registrations: int
     used_count: int
     trial_days: int
+    recipient_referrals_enabled: bool
+    recipient_referral_limit: int
     expires_at: datetime
     revoked_at: datetime | None
     created_at: datetime
@@ -2199,6 +2211,8 @@ class AdminBulkInviteCreateRequest(BaseModel):
     plan_id: UUID
     max_registrations: int = Field(ge=1, le=10000)
     trial_days: int = Field(ge=1, le=30)
+    recipient_referrals_enabled: bool = True
+    recipient_referral_limit: int = Field(default=3, ge=0)
     expires_at: datetime
 
 
@@ -2221,8 +2235,10 @@ class AdminUserSummary(BaseModel):
     invite_issued_at: datetime | None
     invite_redeemed_at: datetime | None
     invited_by_kind: str | None
+    invited_by_origin: Literal["admin", "user", "campaign"] | None
     invited_by_user_id: UUID | None
     invited_by_label: str | None
+    invited_by_campaign_id: UUID | None
     grants: list[GrantSummary]
     configurations: list[ConfigurationSummary]
     profiles: list[ProfileSummary]
@@ -2359,6 +2375,8 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
         pending_email=effective_pending_email,
         plan_id=invite.plan_id,
         wireguard_profile_limit=effective_limit,
+        recipient_referrals_enabled=bool(invite.recipient_referrals_enabled),
+        recipient_referral_limit=int(invite.recipient_referral_limit),
         max_uses=invite.max_uses,
         used_count=invite.used_count,
         expires_at=invite.expires_at,
@@ -2396,6 +2414,8 @@ def _admin_bulk_invite_summary(campaign: BulkInviteCampaign, *, now: datetime | 
         max_registrations=int(campaign.max_registrations),
         used_count=int(campaign.used_count),
         trial_days=int(campaign.trial_days),
+        recipient_referrals_enabled=bool(campaign.recipient_referrals_enabled),
+        recipient_referral_limit=int(campaign.recipient_referral_limit),
         expires_at=campaign.expires_at,
         revoked_at=campaign.revoked_at,
         created_at=campaign.created_at,
@@ -2490,6 +2510,8 @@ def admin_create_bulk_invite(
             max_registrations=payload.max_registrations,
             trial_days=payload.trial_days,
             expires_at=payload.expires_at,
+            recipient_referrals_enabled=payload.recipient_referrals_enabled,
+            recipient_referral_limit=payload.recipient_referral_limit,
             request_id=_request_id(request),
         )
         db.commit()
@@ -3089,8 +3111,15 @@ def admin_list_users(
                 invite_issued_at=invite.created_at if invite else None,
                 invite_redeemed_at=redemption.redeemed_at if redemption else None,
                 invited_by_kind=invite.created_by_kind if invite else None,
+                invited_by_origin=(
+                    "campaign" if invite and invite.bulk_campaign_id is not None
+                    else "user" if invite and invite.created_by_kind == "user"
+                    else "admin" if invite is not None
+                    else None
+                ),
                 invited_by_user_id=invite.created_by_user_id if invite else None,
                 invited_by_label=invite.created_by_label if invite else None,
+                invited_by_campaign_id=invite.bulk_campaign_id if invite else None,
                 grants=_admin_grant_summaries(db, user=user),
                 configurations=_configuration_summaries(db, user=user),
                 profiles=[_profile_summary(profile) for profile in profiles],

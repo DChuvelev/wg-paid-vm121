@@ -146,6 +146,8 @@ def issue_invite(
     ttl_seconds: int,
     plan_id: uuid.UUID,
     wireguard_profile_limit: int | None = None,
+    recipient_referrals_enabled: bool = True,
+    recipient_referral_limit: int = 3,
     created_by_kind: str = "admin",
     created_by_user_id: uuid.UUID | None = None,
     created_by_label: str | None = None,
@@ -159,6 +161,9 @@ def issue_invite(
         raise AuthV2Error("plan is unavailable")
 
     issuer_kind = str(created_by_kind or "").strip().casefold()
+    recipient_referral_limit = int(recipient_referral_limit)
+    if recipient_referral_limit < 0:
+        raise AuthV2Error("recipient referral limit is invalid")
     if issuer_kind not in {"admin", "user", "system"}:
         raise AuthV2Error("invite issuer kind is invalid")
     issuer_user_id = created_by_user_id
@@ -206,6 +211,10 @@ def issue_invite(
         if referral_limit != 0 and active_count >= referral_limit:
             raise AuthV2Error("active referral invite limit reached")
         issuer_label = normalize_email(issuer.email)
+        # User-created referral recipients always inherit the product default.
+        # The referring user cannot delegate or suppress this policy.
+        recipient_referrals_enabled = True
+        recipient_referral_limit = 3
     else:
         if issuer_user_id is not None:
             raise AuthV2Error("non-user invite issuer cannot have a user id")
@@ -234,6 +243,9 @@ def issue_invite(
         pending_email=None,
         wireguard_profile_limit=wg_limit,
         plan_id=plan_id,
+        bulk_campaign_id=None,
+        recipient_referrals_enabled=bool(recipient_referrals_enabled),
+        recipient_referral_limit=recipient_referral_limit,
         max_uses=1,
         used_count=0,
         expires_at=now + timedelta(seconds=ttl_seconds),
@@ -259,6 +271,8 @@ def issue_invite(
             "created_by_kind": issuer_kind,
             "commercial_onboarding": offer is not None,
             "commercial_referral": issuer_kind == "user" and offer is not None,
+            "recipient_referrals_enabled": bool(recipient_referrals_enabled),
+            "recipient_referral_limit": recipient_referral_limit,
         },
     )
     return InviteIssueResult(invite=row, token=tok.raw)
@@ -284,6 +298,8 @@ def issue_bulk_invite_campaign(
     max_registrations: int,
     trial_days: int,
     expires_at: datetime,
+    recipient_referrals_enabled: bool = True,
+    recipient_referral_limit: int = 3,
     request_id: str | None = None,
 ) -> BulkInviteCampaignIssueResult:
     clean_label = str(label or "").strip()
@@ -293,6 +309,9 @@ def issue_bulk_invite_campaign(
         raise BulkInviteRejected("bulk invite capacity is invalid")
     if int(trial_days) < 1:
         raise BulkInviteRejected("bulk invite trial is invalid")
+    recipient_referral_limit = int(recipient_referral_limit)
+    if recipient_referral_limit < 0:
+        raise BulkInviteRejected("bulk invite recipient referral limit is invalid")
     now = utcnow()
     if expires_at.tzinfo is None or expires_at <= now:
         raise BulkInviteRejected("bulk invite expiry is invalid")
@@ -315,6 +334,8 @@ def issue_bulk_invite_campaign(
         max_registrations=int(max_registrations),
         used_count=0,
         trial_days=int(trial_days),
+        recipient_referrals_enabled=bool(recipient_referrals_enabled),
+        recipient_referral_limit=recipient_referral_limit,
         expires_at=expires_at,
         revoked_at=None,
         created_at=now,
@@ -333,6 +354,8 @@ def issue_bulk_invite_campaign(
             "plan_id": str(plan.id),
             "max_registrations": int(max_registrations),
             "trial_days": int(trial_days),
+            "recipient_referrals_enabled": bool(recipient_referrals_enabled),
+            "recipient_referral_limit": recipient_referral_limit,
             "expires_at": expires_at.isoformat(),
         },
     )
@@ -849,6 +872,8 @@ def request_bulk_invite_registration(
             wireguard_profile_limit=int(offer.base_slot_quantity),
             plan_id=campaign.plan_id,
             bulk_campaign_id=campaign.id,
+            recipient_referrals_enabled=bool(campaign.recipient_referrals_enabled),
+            recipient_referral_limit=int(campaign.recipient_referral_limit),
             max_uses=1,
             used_count=0,
             expires_at=campaign.expires_at,
@@ -878,6 +903,8 @@ def request_bulk_invite_registration(
                 "bulk_campaign_id": str(campaign.id),
                 "email_hash": email_fingerprint(normalized),
                 "plan_id": str(campaign.plan_id),
+                "recipient_referrals_enabled": bool(campaign.recipient_referrals_enabled),
+                "recipient_referral_limit": int(campaign.recipient_referral_limit),
             },
         )
     return _request_invite_registration_for_row(
@@ -1442,6 +1469,10 @@ def consume_magic_link(
             request_id=req,
         )
         user = ensure_verified_user(db, normalized, verified_at=now)
+        # This registration path creates a new user only: existing users were
+        # diverted to login before a registration token can be consumed.
+        user.referrals_enabled = bool(invite.recipient_referrals_enabled)
+        user.referral_limit = int(invite.recipient_referral_limit)
         redemption = InviteRedemption(
             id=uuid.uuid4(),
             invite_id=invite.id,
@@ -1534,6 +1565,8 @@ def consume_magic_link(
             payload={
                 "email_hash": email_fingerprint(normalized),
                 "bulk_campaign_id": str(invite.bulk_campaign_id) if invite.bulk_campaign_id else None,
+                "recipient_referrals_enabled": bool(invite.recipient_referrals_enabled),
+                "recipient_referral_limit": int(invite.recipient_referral_limit),
             },
         )
         record_audit_event(
@@ -1548,6 +1581,8 @@ def consume_magic_link(
                 "grant_created": grant is not None,
                 "wireguard_profile_limit": effective_wg_limit,
                 "bulk_campaign_id": str(invite.bulk_campaign_id) if invite.bulk_campaign_id else None,
+                "recipient_referrals_enabled": bool(user.referrals_enabled),
+                "recipient_referral_limit": int(user.referral_limit),
             },
         )
     else:

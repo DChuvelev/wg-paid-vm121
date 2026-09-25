@@ -93,6 +93,7 @@ class BulkInviteCampaign(Base):
         CheckConstraint("max_registrations >= 1", name="bulk_invite_campaigns_max_positive"),
         CheckConstraint("used_count >= 0 AND used_count <= max_registrations", name="bulk_invite_campaigns_used_count_range"),
         CheckConstraint("trial_days >= 1", name="bulk_invite_campaigns_trial_days_positive"),
+        CheckConstraint("recipient_referral_limit >= 0", name="bulk_invite_campaigns_recipient_referral_limit_nonnegative"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -103,6 +104,8 @@ class BulkInviteCampaign(Base):
     max_registrations: Mapped[int] = mapped_column(Integer, nullable=False)
     used_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
     trial_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    recipient_referrals_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"), nullable=False)
+    recipient_referral_limit: Mapped[int] = mapped_column(Integer, default=3, server_default=text("3"), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
@@ -114,6 +117,7 @@ class Invite(Base):
         CheckConstraint("max_uses >= 1", name="invites_max_uses_positive"),
         CheckConstraint("used_count >= 0 AND used_count <= max_uses", name="invites_used_count_range"),
         CheckConstraint("wireguard_profile_limit >= 0", name="invites_wireguard_profile_limit_nonnegative"),
+        CheckConstraint("recipient_referral_limit >= 0", name="invites_recipient_referral_limit_nonnegative"),
         CheckConstraint("created_by_kind IN ('admin','user','system')", name="invites_created_by_kind_check"),
         CheckConstraint(
             "bulk_campaign_id IS NULL OR (intended_email IS NOT NULL AND created_by_kind = 'system' AND created_by_user_id IS NULL AND max_uses = 1)",
@@ -137,6 +141,8 @@ class Invite(Base):
         nullable=True,
         index=True,
     )
+    recipient_referrals_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"), nullable=False)
+    recipient_referral_limit: Mapped[int] = mapped_column(Integer, default=3, server_default=text("3"), nullable=False)
     max_uses: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     used_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
