@@ -59,6 +59,7 @@ from app.services.domain_v2 import (
     record_audit_event,
     request_configuration_disable,
 )
+from app.services.billing import apply_due_quantity_transitions
 
 EXPECTED_PROTOCOLS = {"wireguard", "amneziawg"}
 MODE = os.environ.get("WG_ACCESS_EXPIRY_MODE", "run")
@@ -278,15 +279,45 @@ def _process_due_grant(db, *, grant_id, now):
     }
 
 
+def _due_quantity_transition_ids(db, *, now):
+    return db.execute(
+        select(BillingAccount.id)
+        .where(BillingAccount.pending_period_start.is_not(None))
+        .where(BillingAccount.pending_period_start <= now)
+        .order_by(BillingAccount.pending_period_start.asc(), BillingAccount.id.asc())
+    ).scalars().all()
+
+
 def main():
     now = datetime.now(timezone.utc)
     db = SessionLocal()
     try:
         if MODE == "check":
             finite_grants, finite_slots = _check_finite_grant_integrity(db)
+            due_quantity_ids = _due_quantity_transition_ids(db, now=now)
             db.rollback()
             print(f"FINITE_ACTIVE_GRANTS={finite_grants}")
             print(f"FINITE_ACTIVE_SLOTS_CHECKED={finite_slots}")
+            print(f"DUE_QUANTITY_TRANSITIONS={len(due_quantity_ids)}")
+
+        quantity_transitions_applied = 0
+        quantity_configurations_created = 0
+        quantity_retirements_requested = 0
+        quantity_wakeup = False
+
+        if MODE == "run":
+            quantity_results = apply_due_quantity_transitions(db, now=now)
+            db.commit()
+            quantity_transitions_applied = len(quantity_results)
+            quantity_configurations_created = sum(int(item.configurations_created) for item in quantity_results)
+            quantity_retirements_requested = sum(int(item.retirements_requested) for item in quantity_results)
+            quantity_wakeup = any(bool(item.agent_wakeup_needed) for item in quantity_results)
+            for item in quantity_results:
+                print(
+                    "QUANTITY_TRANSITION="
+                    f"{item.account_id} quantity={item.quantity_before}->{item.quantity_after} "
+                    f"created={item.configurations_created} retirements={item.retirements_requested}"
+                )
 
         due_ids = db.execute(
             select(AccessGrant.id)
@@ -309,7 +340,7 @@ def main():
         commercial_accounts_expired = 0
         referrals_revoked = 0
         failures = []
-        wake_agent = False
+        wake_agent = quantity_wakeup
 
         for grant_id in due_ids:
             try:
@@ -325,11 +356,7 @@ def main():
                 commercial_accounts_expired += result["commercial_accounts_expired"]
                 referrals_revoked += result["referrals_revoked"]
                 wake_agent = wake_agent or bool(result["slots_retired"])
-                print(
-                    "EXPIRED_GRANT="
-                    f"{result['grant_id']} configurations={result['slot_count']} "
-                    f"valid_until={result['valid_until']}"
-                )
+                print("EXPIRED_GRANT=" f"{result['grant_id']} configurations={result['slot_count']} " f"valid_until={result['valid_until']}")
             except Exception as exc:
                 db.rollback()
                 failures.append((str(grant_id), type(exc).__name__, str(exc)))
@@ -337,6 +364,9 @@ def main():
         if wake_agent:
             trigger_wg_access_agent_best_effort()
 
+        print(f"QUANTITY_TRANSITIONS_APPLIED={quantity_transitions_applied}")
+        print(f"QUANTITY_CONFIGURATIONS_CREATED={quantity_configurations_created}")
+        print(f"QUANTITY_RETIREMENTS_REQUESTED={quantity_retirements_requested}")
         print(f"GRANTS_EXPIRED={grants_expired}")
         print(f"SLOTS_RETIREMENT_REQUESTED={slots_retired}")
         print(f"DISABLE_JOBS_CREATED={disable_jobs_created}")
@@ -344,17 +374,11 @@ def main():
         print(f"COMMERCIAL_ACCOUNTS_EXPIRED={commercial_accounts_expired}")
         print(f"REFERRALS_REVOKED={referrals_revoked}")
         print(f"EXPIRY_FAILURES={len(failures)}")
-
         for grant_id, exc_type, message in failures:
-            print(
-                f"EXPIRY_FAILURE grant={grant_id} type={exc_type} detail={message}",
-                file=sys.stderr,
-            )
-
+            print(f"EXPIRY_FAILURE grant={grant_id} type={exc_type} detail={message}", file=sys.stderr)
         if failures:
             print("RESULT=FAIL_DOMAIN_V2_EXPIRY")
             return 1
-
         print("RESULT=PASS_DOMAIN_V2_EXPIRY")
         return 0
     finally:
