@@ -1101,6 +1101,7 @@ class GrantSummary(BaseModel):
     status: str
     plan_id: UUID | None
     valid_until: datetime | None
+    configuration_limit_management: Literal["admin", "billing"]
     configuration_limit: int
     configuration_count: int
     can_create_configuration: bool
@@ -1108,6 +1109,7 @@ class GrantSummary(BaseModel):
 
 
 class BillingAccountSummary(BaseModel):
+    access_grant_id: UUID
     status: Literal["trial", "active_paid", "past_due", "expired"]
     current_period_start: datetime
     current_period_end: datetime
@@ -1156,6 +1158,7 @@ def _grant_summary(
     grant: AccessGrant,
     limits: list[AccessGrantProtocolLimit],
     configuration_count: int,
+    configuration_limit_management: Literal["admin", "billing"],
 ) -> GrantSummary:
     configuration_limit = mirrored_configuration_limit(db, grant_id=grant.id)
     return GrantSummary(
@@ -1163,6 +1166,7 @@ def _grant_summary(
         status=grant.status,
         plan_id=grant.plan_id,
         valid_until=grant.valid_until,
+        configuration_limit_management=configuration_limit_management,
         configuration_limit=configuration_limit,
         configuration_count=configuration_count,
         can_create_configuration=(
@@ -1205,6 +1209,7 @@ def _account_billing_summary(db: Session, *, user: User) -> BillingAccountSummar
     pending_q = int(account.pending_slot_quantity) if account.pending_slot_quantity is not None else None
     point = utcnow()
     return BillingAccountSummary(
+        access_grant_id=account.access_grant_id,
         status=account.status,
         current_period_start=account.current_period_start,
         current_period_end=account.current_period_end,
@@ -1308,6 +1313,9 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
                 grant=g,
                 limits=limits_by_grant.get(g.id, []),
                 configuration_count=configuration_count_by_grant.get(g.id, 0),
+                configuration_limit_management=(
+                    "billing" if billing is not None and g.id == billing.access_grant_id else "admin"
+                ),
             )
             for g in grants
         ],
@@ -2602,7 +2610,16 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
     limits_by_grant: dict[UUID, list[AccessGrantProtocolLimit]] = {}
     configuration_count_by_grant: dict[UUID, int] = {}
 
+    billing_grant_ids: set[UUID] = set()
+
     if grant_ids:
+        billing_grant_ids = set(
+            db.execute(
+                select(BillingAccount.access_grant_id).where(
+                    BillingAccount.access_grant_id.in_(grant_ids)
+                )
+            ).scalars().all()
+        )
         limit_rows = db.execute(
             select(AccessGrantProtocolLimit)
             .where(AccessGrantProtocolLimit.access_grant_id.in_(grant_ids))
@@ -2634,6 +2651,9 @@ def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
             grant=grant,
             limits=limits_by_grant.get(grant.id, []),
             configuration_count=configuration_count_by_grant.get(grant.id, 0),
+            configuration_limit_management=(
+                "billing" if grant.id in billing_grant_ids else "admin"
+            ),
         )
         for grant in grants
     ]
