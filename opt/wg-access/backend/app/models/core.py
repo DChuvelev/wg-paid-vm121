@@ -310,6 +310,17 @@ class BillingAccount(Base):
         CheckConstraint("slot_quantity >= 1", name="billing_accounts_slot_quantity_positive"),
         CheckConstraint("pending_slot_quantity IS NULL OR pending_slot_quantity >= 1", name="billing_accounts_pending_slot_quantity_positive"),
         CheckConstraint("current_period_end > current_period_start", name="billing_accounts_period_positive"),
+        CheckConstraint("quantity_period_end > quantity_period_start", name="billing_accounts_quantity_period_positive"),
+        CheckConstraint(
+            "(pending_slot_quantity IS NULL AND pending_period_start IS NULL AND pending_period_end IS NULL) OR "
+            "(pending_slot_quantity IS NOT NULL AND pending_period_start IS NOT NULL AND pending_period_end IS NOT NULL "
+            "AND pending_period_start = quantity_period_end AND pending_period_end > pending_period_start)",
+            name="billing_accounts_pending_period_shape",
+        ),
+        CheckConstraint(
+            "current_period_end = COALESCE(pending_period_end, quantity_period_end)",
+            name="billing_accounts_paid_through_shape",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -323,6 +334,10 @@ class BillingAccount(Base):
     billing_mode: Mapped[str] = mapped_column(String(16), nullable=False)
     slot_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     pending_slot_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quantity_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    quantity_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    pending_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pending_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     grace_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -331,6 +346,23 @@ class BillingAccount(Base):
     next_charge_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class BillingScheduledRetirement(Base):
+    __tablename__ = "billing_scheduled_retirements"
+    __table_args__ = (
+        UniqueConstraint("billing_account_id", "connection_slot_id", name="uq_billing_scheduled_retirements_account_slot"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    billing_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    connection_slot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("connection_slots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
 
 class BillingPayment(Base):
@@ -359,6 +391,7 @@ class BillingPayment(Base):
     quantity_after: Mapped[int] = mapped_column(Integer, nullable=False)
     target_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     target_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    calculation_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     succeeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

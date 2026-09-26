@@ -21,6 +21,7 @@ from app.services.domain_v2 import (
     ConfigurationRequestResult,
     create_configuration_request,
     create_grant_from_plan,
+    protocol_limit,
     record_audit_event,
     utcnow,
 )
@@ -52,7 +53,13 @@ class ReferralEligibility:
 class TrialRegistrationResult:
     account: BillingAccount
     grant: AccessGrant
-    configuration: ConfigurationRequestResult
+    configurations: tuple[ConfigurationRequestResult, ...]
+
+    @property
+    def configuration(self) -> ConfigurationRequestResult:
+        # Compatibility for the pre-P29G caller; Commercial trial always has at
+        # least one configuration.
+        return self.configurations[0]
 
 
 @dataclass(frozen=True)
@@ -222,12 +229,14 @@ def commercial_invite_is_effective(
     offer = active_offer_for_plan(db, plan_id=invite.plan_id)
     if offer is None:
         return False
-    if int(invite.wireguard_profile_limit or -1) != int(offer.base_slot_quantity):
-        return False
+    quantity = int(invite.wireguard_profile_limit or -1)
+    base_quantity = int(offer.base_slot_quantity)
+    max_quantity = int(offer.max_slot_quantity)
     if invite.bulk_campaign_id is not None:
         campaign = db.get(BulkInviteCampaign, invite.bulk_campaign_id)
         return (
-            campaign is not None
+            quantity == base_quantity
+            and campaign is not None
             and campaign.plan_id == invite.plan_id
             and invite.created_by_kind == "system"
             and invite.created_by_user_id is None
@@ -235,6 +244,8 @@ def commercial_invite_is_effective(
             and int(invite.max_uses) == 1
         )
     if invite.created_by_kind == "user":
+        if quantity != base_quantity:
+            return False
         if invite.created_by_user_id is None:
             return False
         try:
@@ -248,7 +259,16 @@ def commercial_invite_is_effective(
         except ReferralNotEligible:
             return False
         return eligibility.offer.id == offer.id
-    return invite.created_by_kind in {"admin", "system"} and invite.created_by_user_id is None
+    if invite.created_by_kind == "admin":
+        return (
+            invite.created_by_user_id is None
+            and base_quantity <= quantity <= max_quantity
+        )
+    return (
+        invite.created_by_kind == "system"
+        and invite.created_by_user_id is None
+        and quantity == base_quantity
+    )
 
 
 def commercial_referral_invite_is_effective(
@@ -281,9 +301,16 @@ def create_commercial_trial_registration(
     if offer is None:
         raise CommercialRegistrationRejected("commercial offer is unavailable")
     if int(offer.base_slot_quantity) != 1:
-        raise CommercialRegistrationRejected("P29C trial requires one base configuration")
-    if int(invite.wireguard_profile_limit or -1) != int(offer.base_slot_quantity):
-        raise CommercialRegistrationRejected("commercial referral configuration limit drift")
+        raise CommercialRegistrationRejected("commercial base quantity must remain one")
+    trial_quantity = int(invite.wireguard_profile_limit or -1)
+    if invite.bulk_campaign_id is not None or invite.created_by_kind == "user":
+        if trial_quantity != int(offer.base_slot_quantity):
+            raise CommercialRegistrationRejected("commercial referral/campaign trial quantity drift")
+    elif invite.created_by_kind == "admin":
+        if not (int(offer.base_slot_quantity) <= trial_quantity <= int(offer.max_slot_quantity)):
+            raise CommercialRegistrationRejected("commercial Admin trial quantity is invalid")
+    elif trial_quantity != int(offer.base_slot_quantity):
+        raise CommercialRegistrationRejected("commercial system trial quantity drift")
     if db.execute(select(BillingAccount.id).where(BillingAccount.user_id == user.id)).scalar_one_or_none() is not None:
         raise CommercialRegistrationRejected("commercial account already exists")
     plan = db.get(Plan, invite.plan_id)
@@ -329,8 +356,12 @@ def create_commercial_trial_registration(
         offer_id=offer.id,
         status="trial",
         billing_mode="manual",
-        slot_quantity=1,
+        slot_quantity=trial_quantity,
         pending_slot_quantity=None,
+        quantity_period_start=point,
+        quantity_period_end=period_end,
+        pending_period_start=None,
+        pending_period_end=None,
         current_period_start=point,
         current_period_end=period_end,
         grace_until=None,
@@ -342,29 +373,36 @@ def create_commercial_trial_registration(
     )
     db.add(account)
     db.flush()
-    configuration = create_configuration_request(
-        db,
-        user=user,
-        grant_id=grant.id,
-        node_id=wg_node_id,
-        label=None,
-        now=point,
-    )
-    if configuration.slot.expires_at != period_end:
-        raise CommercialRegistrationRejected("trial slot expiry mirror drift")
-    for profile in configuration.profiles.values():
-        if profile.expires_at != period_end:
-            raise CommercialRegistrationRejected("trial profile expiry mirror drift")
-        record_audit_event(
+    for protocol_name in ("wireguard", "amneziawg"):
+        protocol_limit(db, grant_id=grant.id, protocol=protocol_name).profile_limit = trial_quantity
+    db.flush()
+
+    configurations: list[ConfigurationRequestResult] = []
+    for _ in range(trial_quantity):
+        configuration = create_configuration_request(
             db,
-            event_type="profile.requested",
-            actor_kind="system",
-            actor_user_id=user.id,
-            object_type="connection_profile",
-            object_id=str(profile.id),
-            request_id=request_id,
-            payload={"protocol": profile.protocol, "reason": "commercial_trial_registration"},
+            user=user,
+            grant_id=grant.id,
+            node_id=wg_node_id,
+            label=None,
+            now=point,
         )
+        configurations.append(configuration)
+        if configuration.slot.expires_at != period_end:
+            raise CommercialRegistrationRejected("trial slot expiry mirror drift")
+        for profile in configuration.profiles.values():
+            if profile.expires_at != period_end:
+                raise CommercialRegistrationRejected("trial profile expiry mirror drift")
+            record_audit_event(
+                db,
+                event_type="profile.requested",
+                actor_kind="system",
+                actor_user_id=user.id,
+                object_type="connection_profile",
+                object_id=str(profile.id),
+                request_id=request_id,
+                payload={"protocol": profile.protocol, "reason": "commercial_trial_registration"},
+            )
     record_audit_event(
         db,
         event_type="billing.trial.started",
@@ -376,10 +414,14 @@ def create_commercial_trial_registration(
         payload={
             "offer_code": offer.code,
             "trial_days": effective_trial_days,
-            "slot_quantity": 1,
+            "slot_quantity": trial_quantity,
             "invite_id": str(invite.id),
             "inviter_user_id": str(invite.created_by_user_id) if invite.created_by_user_id else None,
             "bulk_campaign_id": str(invite.bulk_campaign_id) if invite.bulk_campaign_id else None,
         },
     )
-    return TrialRegistrationResult(account=account, grant=grant, configuration=configuration)
+    return TrialRegistrationResult(
+        account=account,
+        grant=grant,
+        configurations=tuple(configurations),
+    )

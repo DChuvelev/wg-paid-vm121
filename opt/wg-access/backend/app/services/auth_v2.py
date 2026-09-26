@@ -244,9 +244,18 @@ def issue_invite(
         if offer is not None:
             if int(plan.default_wireguard_limit) != int(offer.base_slot_quantity) or int(plan.default_amneziawg_limit) != int(offer.base_slot_quantity):
                 raise AuthV2Error("commercial plan configuration limit drift")
-            if wireguard_profile_limit is not None and int(wireguard_profile_limit) != int(offer.base_slot_quantity):
-                raise AuthV2Error("commercial onboarding configuration limit is fixed")
-            wg_limit = int(offer.base_slot_quantity)
+            if issuer_kind == "admin":
+                wg_limit = (
+                    int(offer.base_slot_quantity)
+                    if wireguard_profile_limit is None
+                    else int(wireguard_profile_limit)
+                )
+                if not (int(offer.base_slot_quantity) <= wg_limit <= int(offer.max_slot_quantity)):
+                    raise AuthV2Error("commercial Admin onboarding quantity is outside the active offer")
+            else:
+                if wireguard_profile_limit is not None and int(wireguard_profile_limit) != int(offer.base_slot_quantity):
+                    raise AuthV2Error("commercial non-Admin onboarding configuration limit is fixed")
+                wg_limit = int(offer.base_slot_quantity)
         else:
             wg_limit = plan.default_wireguard_limit if wireguard_profile_limit is None else int(wireguard_profile_limit)
             if wg_limit < 0:
@@ -1662,8 +1671,11 @@ def consume_magic_link(
                 except CommercialRegistrationRejected as exc:
                     raise MagicLinkRejected("invalid magic link") from exc
                 grant = trial.grant
-                effective_wg_limit = int(offer.base_slot_quantity)
-                if any(trial.configuration.created_jobs.values()):
+                effective_wg_limit = int(trial.account.slot_quantity)
+                if any(
+                    any(configuration.created_jobs.values())
+                    for configuration in trial.configurations
+                ):
                     agent_wakeup_needed = True
             else:
                 grant = create_grant_from_plan(

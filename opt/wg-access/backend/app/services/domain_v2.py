@@ -659,6 +659,7 @@ def create_configuration_request(
     node_id: str,
     label: str | None = None,
     now: datetime | None = None,
+    slot_id: uuid.UUID | None = None,
 ) -> ConfigurationRequestResult:
     point = now or utcnow()
     grant = db.execute(
@@ -676,7 +677,7 @@ def create_configuration_request(
 
     normalized_label = str(label).strip() if label is not None else ""
     slot = ConnectionSlot(
-        id=uuid.uuid4(),
+        id=slot_id or uuid.uuid4(),
         user_id=user.id,
         access_grant_id=grant.id,
         node_id=node_id,

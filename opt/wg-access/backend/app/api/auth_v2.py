@@ -79,9 +79,12 @@ from app.services.billing import (
     BillingProviderMismatch,
     BillingUnavailable,
     bind_provider_create_response,
+    current_quantity_period_is_paid,
     monthly_amount_kopeks,
     prepare_manual_payment_intent,
     reconcile_payment,
+    scheduled_retirement_configuration_ids,
+    update_scheduled_retirement_selection,
 )
 from app.services.yookassa import (
     YooKassaError,
@@ -1108,8 +1111,20 @@ class BillingAccountSummary(BaseModel):
     status: Literal["trial", "active_paid", "past_due", "expired"]
     current_period_start: datetime
     current_period_end: datetime
+    quantity_period_start: datetime
+    quantity_period_end: datetime
     slot_quantity: int
     monthly_amount_kopeks: int
+    min_slot_quantity: int
+    max_slot_quantity: int
+    extra_slot_monthly_kopeks: int
+    pending_slot_quantity: int | None
+    pending_period_start: datetime | None
+    pending_period_end: datetime | None
+    pending_monthly_amount_kopeks: int | None
+    retirement_configuration_ids: list[UUID]
+    can_renew: bool
+    can_add_devices_now: bool
     currency: str
 
 
@@ -1186,12 +1201,38 @@ def _account_billing_summary(db: Session, *, user: User) -> BillingAccountSummar
         or user.deletion_requested_at is not None
     ):
         raise HTTPException(status_code=409, detail="commercial billing state unavailable")
+    retirement_ids = scheduled_retirement_configuration_ids(db, account=account)
+    pending_q = int(account.pending_slot_quantity) if account.pending_slot_quantity is not None else None
+    point = utcnow()
     return BillingAccountSummary(
         status=account.status,
         current_period_start=account.current_period_start,
         current_period_end=account.current_period_end,
+        quantity_period_start=account.quantity_period_start,
+        quantity_period_end=account.quantity_period_end,
         slot_quantity=int(account.slot_quantity),
         monthly_amount_kopeks=monthly_amount_kopeks(offer, int(account.slot_quantity)),
+        min_slot_quantity=int(offer.base_slot_quantity),
+        max_slot_quantity=int(offer.max_slot_quantity),
+        extra_slot_monthly_kopeks=int(offer.extra_slot_monthly_kopeks),
+        pending_slot_quantity=pending_q,
+        pending_period_start=account.pending_period_start,
+        pending_period_end=account.pending_period_end,
+        pending_monthly_amount_kopeks=(
+            monthly_amount_kopeks(offer, pending_q) if pending_q is not None else None
+        ),
+        retirement_configuration_ids=retirement_ids,
+        can_renew=(
+            account.billing_mode == "manual"
+            and account.status in {"trial", "active_paid", "expired"}
+            and account.pending_slot_quantity is None
+        ),
+        can_add_devices_now=(
+            account.status == "active_paid"
+            and int(account.slot_quantity) < int(offer.max_slot_quantity)
+            and account.quantity_period_start <= point < account.quantity_period_end
+            and current_quantity_period_is_paid(db, account=account, now=point)
+        ),
         currency=offer.currency,
     )
 
@@ -1312,6 +1353,15 @@ def account_me_update(
     return _account_me_response(db, user=user)
 
 
+class BillingPaymentCreateRequest(BaseModel):
+    action: Literal["renew", "add_now", "top_up_next"] = "renew"
+    target_quantity: int | None = Field(default=None, ge=1)
+    apply_now: bool = False
+    future_choice: Literal["preserve", "keep_paid"] | None = None
+    retire_configuration_ids: list[UUID] = Field(default_factory=list)
+    retire_new_configuration_ordinals: list[int] = Field(default_factory=list)
+
+
 class BillingPaymentSummary(BaseModel):
     payment_id: UUID
     status: Literal["created", "pending", "succeeded", "canceled"]
@@ -1319,8 +1369,11 @@ class BillingPaymentSummary(BaseModel):
     kind: Literal["initial", "manual_renewal", "auto_renewal", "upgrade"]
     amount_kopeks: int
     currency: str
+    quantity_before: int
+    quantity_after: int
     target_period_start: datetime | None
     target_period_end: datetime | None
+    calculation: dict | None
     created_at: datetime
     updated_at: datetime
     succeeded_at: datetime | None
@@ -1335,8 +1388,11 @@ def _billing_payment_summary(payment: BillingPayment, *, confirmation_url: str |
         kind=payment.kind,
         amount_kopeks=int(payment.amount_kopeks),
         currency=payment.currency,
+        quantity_before=int(payment.quantity_before),
+        quantity_after=int(payment.quantity_after),
         target_period_start=payment.target_period_start,
         target_period_end=payment.target_period_end,
+        calculation=payment.calculation_json,
         created_at=payment.created_at,
         updated_at=payment.updated_at,
         succeeded_at=payment.succeeded_at,
@@ -1357,6 +1413,7 @@ def _provider_confirmation_url(provider: dict) -> str | None:
 )
 def account_billing_payment_create(
     request: Request,
+    payload: BillingPaymentCreateRequest | None = None,
     idempotency_key: str = Header(alias="Idempotency-Key"),
     current: tuple[AuthSession, User] = Depends(_current_session),
     db: Session = Depends(get_db),
@@ -1365,14 +1422,24 @@ def account_billing_payment_create(
 ):
     _, user = current
     try:
+        body = payload or BillingPaymentCreateRequest()
         intent = prepare_manual_payment_intent(
             db,
             user=user,
             idempotence_key=idempotency_key,
+            action=body.action,
+            target_quantity=body.target_quantity,
+            apply_now=body.apply_now,
+            future_choice=body.future_choice,
+            retire_configuration_ids=list(body.retire_configuration_ids),
+            retire_new_configuration_ordinals=list(body.retire_new_configuration_ordinals),
             now=utcnow(),
         )
         db.commit()
         db.refresh(intent.payment)
+    except BillingConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BillingError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="payment cannot be created") from exc
@@ -1421,6 +1488,53 @@ def account_billing_payment_create(
     except (BillingError, YooKassaError) as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="payment provider state mismatch") from exc
+
+
+class BillingRetirementSelectionRequest(BaseModel):
+    configuration_ids: list[UUID]
+
+
+class BillingRetirementSelectionResponse(BaseModel):
+    configuration_ids: list[UUID]
+    effective_at: datetime
+
+
+@router.put(
+    "/account/billing/pending-retirements",
+    response_model=BillingRetirementSelectionResponse,
+)
+def account_billing_pending_retirements_update(
+    payload: BillingRetirementSelectionRequest,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        selected = update_scheduled_retirement_selection(
+            db,
+            user=user,
+            configuration_ids=list(payload.configuration_ids),
+            now=utcnow(),
+        )
+        account = db.execute(
+            select(BillingAccount).where(BillingAccount.user_id == user.id)
+        ).scalar_one()
+        effective_at = account.pending_period_start
+        if effective_at is None:
+            raise BillingConflict("pending retirement boundary disappeared")
+        db.commit()
+        return BillingRetirementSelectionResponse(
+            configuration_ids=selected,
+            effective_at=effective_at,
+        )
+    except BillingConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BillingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="retirement selection cannot be updated") from exc
 
 
 @router.get("/account/billing/payments", response_model=list[BillingPaymentSummary])
@@ -2192,6 +2306,8 @@ class AdminPlanSummary(BaseModel):
     default_wireguard_limit: int
     default_amneziawg_limit: int
     trial_days: int | None
+    commercial_min_quantity: int | None
+    commercial_max_quantity: int | None
 
 
 class AdminInviteSummary(BaseModel):
@@ -2543,6 +2659,8 @@ def admin_list_plans(db: Session = Depends(get_db)):
             default_wireguard_limit=row.default_wireguard_limit,
             default_amneziawg_limit=row.default_amneziawg_limit,
             trial_days=int(offer.trial_days) if offer is not None else None,
+            commercial_min_quantity=int(offer.base_slot_quantity) if offer is not None else None,
+            commercial_max_quantity=int(offer.max_slot_quantity) if offer is not None else None,
         ))
     return result
 
@@ -2764,9 +2882,11 @@ def admin_update_invite_wireguard_limit(
         db.rollback()
         raise HTTPException(status_code=409, detail="user referral invite is not admin-mutable")
     offer = active_offer_for_plan(db, plan_id=invite.plan_id) if invite.plan_id is not None else None
-    if offer is not None and int(payload.profile_limit) != int(offer.base_slot_quantity):
+    if offer is not None and not (
+        int(offer.base_slot_quantity) <= int(payload.profile_limit) <= int(offer.max_slot_quantity)
+    ):
         db.rollback()
-        raise HTTPException(status_code=409, detail="commercial onboarding configuration limit is fixed")
+        raise HTTPException(status_code=409, detail="commercial onboarding quantity is outside the active offer")
     now = utcnow()
     if _invite_lifecycle_state(invite, now=now) not in {"active", "awaiting_confirmation"}:
         db.rollback()
@@ -3339,6 +3459,15 @@ def admin_set_protocol_limit(
     ).scalar_one_or_none()
     if grant is None:
         raise HTTPException(status_code=404, detail="grant not found")
+
+    commercial_account_id = db.execute(
+        select(BillingAccount.id).where(BillingAccount.access_grant_id == grant.id)
+    ).scalar_one_or_none()
+    if commercial_account_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="commercial configuration quantity is managed by billing",
+        )
 
     limit_rows = db.execute(
         select(AccessGrantProtocolLimit)
