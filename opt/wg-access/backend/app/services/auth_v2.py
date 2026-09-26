@@ -164,6 +164,7 @@ def issue_invite(
     wireguard_profile_limit: int | None = None,
     recipient_referrals_enabled: bool = True,
     recipient_referral_limit: int = 3,
+    trial_days_override: int | None = None,
     created_by_kind: str = "admin",
     created_by_user_id: uuid.UUID | None = None,
     created_by_label: str | None = None,
@@ -177,6 +178,10 @@ def issue_invite(
         raise AuthV2Error("plan is unavailable")
 
     issuer_kind = str(created_by_kind or "").strip().casefold()
+    if trial_days_override is not None:
+        trial_days_override = int(trial_days_override)
+        if trial_days_override < 1 or trial_days_override > 30:
+            raise AuthV2Error("invite trial duration is invalid")
     recipient_referral_limit = int(recipient_referral_limit)
     if recipient_referral_limit < 0:
         raise AuthV2Error("recipient referral limit is invalid")
@@ -187,6 +192,8 @@ def issue_invite(
     offer = active_offer_for_plan(db, plan_id=plan.id)
 
     if issuer_kind == "user":
+        if trial_days_override is not None:
+            raise AuthV2Error("user referral trial duration is fixed")
         if issuer_user_id is None:
             raise AuthV2Error("invite issuer user is required")
         issuer = db.get(User, issuer_user_id)
@@ -244,6 +251,11 @@ def issue_invite(
             wg_limit = plan.default_wireguard_limit if wireguard_profile_limit is None else int(wireguard_profile_limit)
             if wg_limit < 0:
                 raise AuthV2Error("wireguard profile limit is invalid")
+        if trial_days_override is not None:
+            if issuer_kind != "admin":
+                raise AuthV2Error("invite trial override is admin-only")
+            if offer is None:
+                raise AuthV2Error("invite trial override requires a commercial plan")
         issuer_label = str(created_by_label or ("Admin" if issuer_kind == "admin" else "System")).strip()
         if not issuer_label or len(issuer_label) > 320:
             raise AuthV2Error("invite issuer label is invalid")
@@ -262,6 +274,7 @@ def issue_invite(
         bulk_campaign_id=None,
         recipient_referrals_enabled=bool(recipient_referrals_enabled),
         recipient_referral_limit=recipient_referral_limit,
+        trial_days_override=trial_days_override,
         max_uses=1,
         used_count=0,
         expires_at=now + timedelta(seconds=ttl_seconds),
@@ -289,6 +302,8 @@ def issue_invite(
             "commercial_referral": issuer_kind == "user" and offer is not None,
             "recipient_referrals_enabled": bool(recipient_referrals_enabled),
             "recipient_referral_limit": recipient_referral_limit,
+            "trial_days_override": trial_days_override,
+            "effective_trial_days": int(trial_days_override) if trial_days_override is not None else int(offer.trial_days) if offer is not None else None,
         },
     )
     return InviteIssueResult(invite=row, token=tok.raw)
@@ -1002,6 +1017,7 @@ def request_bulk_invite_registration(
             bulk_campaign_id=campaign.id,
             recipient_referrals_enabled=bool(campaign.recipient_referrals_enabled),
             recipient_referral_limit=int(campaign.recipient_referral_limit),
+            trial_days_override=None,
             max_uses=1,
             used_count=0,
             expires_at=campaign.expires_at,

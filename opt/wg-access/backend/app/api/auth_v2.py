@@ -486,6 +486,7 @@ class AdminInviteRequest(BaseModel):
     wireguard_profile_limit: int | None = Field(default=None, ge=0)
     recipient_referrals_enabled: bool = True
     recipient_referral_limit: int = Field(default=3, ge=0)
+    trial_days: int | None = Field(default=None, ge=1, le=30)
 
 
 class AdminInviteResponse(BaseModel):
@@ -496,6 +497,7 @@ class AdminInviteResponse(BaseModel):
     wireguard_profile_limit: int
     recipient_referrals_enabled: bool
     recipient_referral_limit: int
+    trial_days: int | None
     email_sent: bool
 
 
@@ -521,6 +523,7 @@ def admin_create_invite(
             wireguard_profile_limit=payload.wireguard_profile_limit,
             recipient_referrals_enabled=payload.recipient_referrals_enabled,
             recipient_referral_limit=payload.recipient_referral_limit,
+            trial_days_override=payload.trial_days,
             created_by_kind="admin",
             created_by_user_id=None,
             created_by_label="Admin",
@@ -540,6 +543,7 @@ def admin_create_invite(
     except (AuthV2Error, InvalidIdentity) as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail="invite cannot be issued") from exc
+    offer = active_offer_for_plan(db, plan_id=result.invite.plan_id) if result.invite.plan_id is not None else None
     return AdminInviteResponse(
         invite_id=result.invite.id,
         invite_token=result.token,
@@ -548,6 +552,11 @@ def admin_create_invite(
         wireguard_profile_limit=result.invite.wireguard_profile_limit,
         recipient_referrals_enabled=bool(result.invite.recipient_referrals_enabled),
         recipient_referral_limit=int(result.invite.recipient_referral_limit),
+        trial_days=(
+            int(result.invite.trial_days_override)
+            if result.invite.trial_days_override is not None
+            else int(offer.trial_days) if offer is not None else None
+        ),
         email_sent=email_sent,
     )
 
@@ -2182,6 +2191,7 @@ class AdminPlanSummary(BaseModel):
     active: bool
     default_wireguard_limit: int
     default_amneziawg_limit: int
+    trial_days: int | None
 
 
 class AdminInviteSummary(BaseModel):
@@ -2195,6 +2205,7 @@ class AdminInviteSummary(BaseModel):
     wireguard_profile_limit: int
     recipient_referrals_enabled: bool
     recipient_referral_limit: int
+    trial_days: int | None
     max_uses: int
     used_count: int
     expires_at: datetime | None
@@ -2398,6 +2409,15 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
         if invite.wireguard_profile_limit is not None
         else int(plan.default_wireguard_limit) if plan is not None else 0
     )
+    offer = active_offer_for_plan(db, plan_id=invite.plan_id) if invite.plan_id is not None else None
+    if campaign is not None:
+        effective_trial_days = int(campaign.trial_days)
+    elif invite.trial_days_override is not None:
+        effective_trial_days = int(invite.trial_days_override)
+    elif offer is not None:
+        effective_trial_days = int(offer.trial_days)
+    else:
+        effective_trial_days = None
     return AdminInviteSummary(
         invite_id=invite.id,
         origin=origin,
@@ -2409,6 +2429,7 @@ def _admin_invite_summary(db: Session, invite: Invite, *, now: datetime | None =
         wireguard_profile_limit=effective_limit,
         recipient_referrals_enabled=bool(invite.recipient_referrals_enabled),
         recipient_referral_limit=int(invite.recipient_referral_limit),
+        trial_days=effective_trial_days,
         max_uses=invite.max_uses,
         used_count=invite.used_count,
         expires_at=invite.expires_at,
@@ -2511,17 +2532,19 @@ def admin_list_plans(db: Session = Depends(get_db)):
     rows = db.execute(
         select(Plan).order_by(Plan.created_at.asc())
     ).scalars().all()
-    return [
-        AdminPlanSummary(
+    result: list[AdminPlanSummary] = []
+    for row in rows:
+        offer = active_offer_for_plan(db, plan_id=row.id)
+        result.append(AdminPlanSummary(
             id=row.id,
             code=row.code,
             display_name=row.display_name,
             active=row.active,
             default_wireguard_limit=row.default_wireguard_limit,
             default_amneziawg_limit=row.default_amneziawg_limit,
-        )
-        for row in rows
-    ]
+            trial_days=int(offer.trial_days) if offer is not None else None,
+        ))
+    return result
 
 
 @router.post(

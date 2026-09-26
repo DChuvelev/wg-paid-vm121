@@ -303,7 +303,12 @@ def create_commercial_trial_registration(
     else:
         if bulk_capacity_claimed:
             raise CommercialRegistrationRejected("unexpected bulk capacity claim")
-        effective_trial_days = int(offer.trial_days)
+        if invite.trial_days_override is not None:
+            if invite.created_by_kind != "admin":
+                raise CommercialRegistrationRejected("trial override is not valid for this invite")
+            effective_trial_days = int(invite.trial_days_override)
+        else:
+            effective_trial_days = int(offer.trial_days)
     if effective_trial_days < 1:
         raise CommercialRegistrationRejected("commercial trial duration is invalid")
 
