@@ -269,6 +269,54 @@ def _ensure_no_other_inflight_payment(db: Session, *, account: BillingAccount) -
         raise BillingConflict("another commercial payment is still in progress")
 
 
+def _inflight_payment_allows_retirement_reselection(
+    payment: BillingPayment,
+    *,
+    account: BillingAccount,
+) -> bool:
+    calculation = payment.calculation_json
+    if not isinstance(calculation, dict) or int(calculation.get("version") or 0) != 1:
+        return False
+    if str(calculation.get("action") or "") != "top_up_next":
+        return False
+    if account.pending_slot_quantity is None:
+        return False
+    try:
+        target_q = int(calculation.get("target_quantity"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        target_q > int(account.pending_slot_quantity)
+        and target_q >= int(account.slot_quantity)
+    )
+
+
+def _ensure_retirement_reselection_not_conflicted_by_inflight_payment(
+    db: Session,
+    *,
+    account: BillingAccount,
+) -> None:
+    inflight = list(
+        db.execute(
+            select(BillingPayment)
+            .where(
+                BillingPayment.billing_account_id == account.id,
+                BillingPayment.status.in_(("created", "pending")),
+            )
+            .order_by(BillingPayment.created_at.asc(), BillingPayment.id.asc())
+            .limit(2)
+        ).scalars().all()
+    )
+    if not inflight:
+        return
+    if len(inflight) == 1 and _inflight_payment_allows_retirement_reselection(
+        inflight[0],
+        account=account,
+    ):
+        return
+    raise BillingConflict("another commercial payment is still in progress")
+
+
 def _calculation_line(
     *,
     kind: str,
@@ -848,7 +896,10 @@ def update_scheduled_retirement_selection(
         raise BillingConflict("there is no pending quantity decrease")
     if account.pending_period_start <= point:
         raise BillingConflict("pending quantity transition is already due")
-    _ensure_no_other_inflight_payment(db, account=account)
+    _ensure_retirement_reselection_not_conflicted_by_inflight_payment(
+        db,
+        account=account,
+    )
     required = int(account.slot_quantity) - int(account.pending_slot_quantity)
     selected = _validate_retirement_selection(
         db,
