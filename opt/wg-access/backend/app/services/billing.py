@@ -351,6 +351,7 @@ def prepare_manual_payment_intent(
     quantity_before = current_q
     quantity_after = target_q
     normalized_future_choice = str(future_choice).strip().casefold() if future_choice else None
+    trial_tail_materialize = False
 
     if action == "renew":
         if selected_new_ordinals:
@@ -400,6 +401,10 @@ def prepare_manual_payment_intent(
                 )
             elif selected:
                 raise BillingConflict("retirement Configuration ids are not needed")
+
+            if account.status == "trial" and target_q > current_q:
+                trial_tail_materialize = True
+                planned_new_ids = [uuid.uuid4() for _ in range(target_q - current_q)]
 
             if apply_now:
                 if account.status != "active_paid":
@@ -530,6 +535,13 @@ def prepare_manual_payment_intent(
         quantity_before = pending_q
         target_start = account.pending_period_start
         target_end = account.pending_period_end
+        if (
+            account.status == "active_paid"
+            and target_q > current_q
+            and not _current_quantity_period_is_paid(db, account=account, point=point)
+        ):
+            trial_tail_materialize = True
+            planned_new_ids = [uuid.uuid4() for _ in range(target_q - current_q)]
         required_retirements = max(0, current_q - target_q)
         if required_retirements:
             _validate_retirement_selection(
@@ -553,6 +565,7 @@ def prepare_manual_payment_intent(
         "target_quantity": target_q,
         "apply_now": bool(apply_now),
         "future_choice": normalized_future_choice,
+        "trial_tail_materialize": trial_tail_materialize,
         "planned_configuration_ids": [str(value) for value in planned_new_ids],
         "retire_configuration_ids": [str(value) for value in selected],
         "retire_new_configuration_ordinals": selected_new_ordinals,
@@ -928,6 +941,7 @@ def _apply_succeeded_payment(
     _monthly_amount_kopeks(offer, target_q)
     planned_ids = [uuid.UUID(str(value)) for value in calculation.get("planned_configuration_ids") or []]
     retire_ids = [uuid.UUID(str(value)) for value in calculation.get("retire_configuration_ids") or []]
+    trial_tail_materialize = bool(calculation.get("trial_tail_materialize"))
     first_configuration: ConfigurationRequestResult | None = None
 
     if action == "renew":
@@ -989,10 +1003,15 @@ def _apply_succeeded_payment(
             grant.status = "active"
             _extend_live_mirror(db, account=account, grant=grant, period_end=target_end)
 
-            if bool(calculation.get("apply_now")):
-                if target_q <= int(account.slot_quantity):
-                    raise BillingConflict("frozen apply-now quantity is invalid")
+            materialize_now = bool(calculation.get("apply_now")) or trial_tail_materialize
+            if materialize_now:
                 before = int(account.slot_quantity)
+                if target_q <= before:
+                    raise BillingConflict("frozen immediate materialization quantity is invalid")
+                if trial_tail_materialize:
+                    expected_status = str(expected.get("status") or "")
+                    if expected_status != "trial" or bool(calculation.get("apply_now")):
+                        raise BillingConflict("frozen trial-tail materialization intent is invalid")
                 _set_mirrored_configuration_limit(db, grant_id=grant.id, quantity=target_q)
                 account.slot_quantity = target_q
                 created = _create_missing_configurations(
@@ -1073,6 +1092,27 @@ def _apply_succeeded_payment(
         if target_q <= int(account.pending_slot_quantity):
             raise BillingConflict("frozen next-period top-up target is invalid")
         account.pending_slot_quantity = target_q
+        if trial_tail_materialize:
+            before = int(account.slot_quantity)
+            if target_q <= before:
+                raise BillingConflict("frozen trial-tail top-up materialization quantity is invalid")
+            _set_mirrored_configuration_limit(db, grant_id=grant.id, quantity=target_q)
+            account.slot_quantity = target_q
+            created = _create_missing_configurations(
+                db,
+                user=user,
+                grant=grant,
+                count=target_q - before,
+                now=captured_at,
+                planned_ids=planned_ids,
+            )
+            first_configuration = created[0] if created else None
+            _extend_live_mirror(
+                db,
+                account=account,
+                grant=grant,
+                period_end=account.current_period_end,
+            )
         required = max(0, int(account.slot_quantity) - target_q)
         if required:
             _validate_retirement_selection(
