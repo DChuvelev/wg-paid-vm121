@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.session import get_db
-from app.models import ConnectionProfile, Peer, PeerCredential, ProvisioningJob
+from app.models import ConnectionProfile, ConnectionSlot, Peer, PeerCredential, ProvisioningJob
 from app.services.user_deletion import finalize_user_deletion_if_ready
 from app.services.credential_service import CredentialServiceError, decrypt_profile_credential
 from app.services.runtime_snapshot import replace_runtime_snapshot
@@ -96,6 +96,75 @@ def get_enabled_peers(
                 tunnel_ip=profile.tunnel_ip,
                 paid_until=profile.expires_at,
                 enabled=True,
+            )
+        )
+    return result
+
+
+
+class AgentRoutingVariantResponse(BaseModel):
+    protocol: Literal["wireguard", "amneziawg"]
+    profile_id: UUID
+    tunnel_ip: str
+
+
+class AgentRoutingOverrideResponse(BaseModel):
+    configuration_id: UUID
+    selector: int = Field(ge=1, le=5)
+    expires_at: datetime
+    variants: list[AgentRoutingVariantResponse]
+
+
+@router.get("/routing-overrides", response_model=list[AgentRoutingOverrideResponse])
+def get_active_routing_overrides(
+    node_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(check_agent_token),
+):
+    now = datetime.now(timezone.utc)
+    slots = db.execute(
+        select(ConnectionSlot)
+        .where(ConnectionSlot.disabled_at.is_(None))
+        .where(ConnectionSlot.forced_selector.is_not(None))
+        .where(ConnectionSlot.forced_until.is_not(None))
+        .where(ConnectionSlot.forced_until > now)
+        .order_by(ConnectionSlot.id.asc())
+    ).scalars().all()
+
+    slot_ids = [slot.id for slot in slots]
+    variants_by_slot: dict[UUID, list[AgentRoutingVariantResponse]] = {}
+    if slot_ids:
+        profiles = db.execute(
+            select(ConnectionProfile)
+            .where(ConnectionProfile.connection_slot_id.in_(slot_ids))
+            .where(ConnectionProfile.node_id == node_id)
+            .where(ConnectionProfile.status == "active")
+            .where(ConnectionProfile.tunnel_ip.is_not(None))
+            .order_by(
+                ConnectionProfile.connection_slot_id.asc(),
+                ConnectionProfile.protocol.asc(),
+                ConnectionProfile.id.asc(),
+            )
+        ).scalars().all()
+        for profile in profiles:
+            variants_by_slot.setdefault(profile.connection_slot_id, []).append(
+                AgentRoutingVariantResponse(
+                    protocol=profile.protocol,
+                    profile_id=profile.id,
+                    tunnel_ip=profile.tunnel_ip,
+                )
+            )
+
+    result: list[AgentRoutingOverrideResponse] = []
+    for slot in slots:
+        if slot.forced_selector is None or slot.forced_until is None:
+            continue
+        result.append(
+            AgentRoutingOverrideResponse(
+                configuration_id=slot.id,
+                selector=int(slot.forced_selector),
+                expires_at=slot.forced_until,
+                variants=variants_by_slot.get(slot.id, []),
             )
         )
     return result

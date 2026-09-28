@@ -2123,6 +2123,7 @@ def account_configuration_update_routing(
             request_id=_request_id(request),
         )
         db.commit()
+        trigger_wg_access_agent_best_effort()
     except ConfigurationRoutingUnavailable as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail="configuration unavailable") from exc

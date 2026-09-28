@@ -54,7 +54,12 @@ REMOTE_REGISTRY_FILE = env.get(
     "REMOTE_REGISTRY_FILE",
     "/etc/router-wgpay-peer-state/registry.tsv",
 )
+REMOTE_FORCED_EGRESS_COMMAND = env.get(
+    "REMOTE_FORCED_EGRESS_COMMAND",
+    "/usr/local/sbin/router-wgpay-forced-egress.sh",
+)
 MANAGED_PROTOCOLS = ("wireguard", "amneziawg")
+ROUTING_OVERRIDE_PREFIX = "cfg:"
 
 
 def log(msg):
@@ -530,6 +535,269 @@ def sync_enabled_peers():
     return desired, registry_after
 
 
+
+def parse_iso8601_epoch(value):
+    text = str(value or "").strip()
+    if not text:
+        raise RuntimeError("routing override expires_at is required")
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("routing override expires_at is invalid") from exc
+    if dt.tzinfo is None:
+        raise RuntimeError("routing override expires_at must be timezone-aware")
+    return int(dt.timestamp())
+
+
+def normalize_routing_override(row):
+    configuration_id = str(row.get("configuration_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", configuration_id):
+        raise RuntimeError("routing override configuration_id is invalid")
+
+    selector_number = row.get("selector")
+    if not isinstance(selector_number, int) or selector_number not in {1, 2, 3, 4, 5}:
+        raise RuntimeError("routing override selector must be 1..5")
+
+    expires_epoch = parse_iso8601_epoch(row.get("expires_at"))
+    variants = row.get("variants")
+    if not isinstance(variants, list):
+        raise RuntimeError("routing override variants must be a list")
+
+    tunnel_ips = []
+    variant_summary = []
+    seen_ips = set()
+    seen_protocols = set()
+    for variant in variants:
+        if not isinstance(variant, dict):
+            raise RuntimeError("routing override variant is invalid")
+        protocol = require_protocol(variant.get("protocol"))
+        if protocol in seen_protocols:
+            raise RuntimeError(
+                f"duplicate routing override protocol configuration_id={configuration_id}"
+            )
+        seen_protocols.add(protocol)
+        tunnel_ip = require_tunnel_ip(variant.get("tunnel_ip"))
+        if tunnel_ip in seen_ips:
+            raise RuntimeError(
+                f"duplicate routing override tunnel_ip configuration_id={configuration_id}"
+            )
+        seen_ips.add(tunnel_ip)
+        tunnel_ips.append(tunnel_ip)
+        variant_summary.append({
+            "protocol": protocol,
+            "profile_id": str(variant.get("profile_id") or ""),
+            "tunnel_ip": tunnel_ip,
+        })
+
+    return {
+        "configuration_id": configuration_id,
+        "override_id": ROUTING_OVERRIDE_PREFIX + configuration_id,
+        "selector": f"cs{selector_number}",
+        "selector_number": selector_number,
+        "expires_epoch": expires_epoch,
+        "tunnel_ips": sorted(tunnel_ips, key=ipaddress.ip_address),
+        "variants": variant_summary,
+    }
+
+
+def fetch_routing_overrides():
+    query = parse.urlencode({"node_id": NODE_ID})
+    rows = http_json("GET", f"/agent/routing-overrides?{query}") or []
+    if not isinstance(rows, list):
+        raise RuntimeError("routing override desired state must be a list")
+
+    desired = {}
+    for row in rows:
+        item = normalize_routing_override(row)
+        override_id = item["override_id"]
+        if override_id in desired:
+            raise RuntimeError(f"duplicate routing override id: {override_id}")
+        desired[override_id] = item
+    return desired
+
+
+def parse_remote_forced_status(text):
+    groups = {}
+    accepted = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "RESULT=PASS_FORCED_EGRESS_STATUS":
+            accepted = True
+            continue
+        parts = line.split("\t")
+        if not parts or parts[0] != "override":
+            continue
+        if len(parts) != 5:
+            raise RuntimeError("invalid VM100 forced-egress status row")
+        _, override_id, selector, expires_text, tunnel_ip = parts
+        if not override_id.startswith(ROUTING_OVERRIDE_PREFIX):
+            continue
+        if not re.fullmatch(r"cfg:[0-9a-fA-F-]{36}", override_id):
+            raise RuntimeError("invalid managed VM100 forced override id")
+        if selector not in {"cs1", "cs2", "cs3", "cs4", "cs5"}:
+            raise RuntimeError("invalid VM100 forced selector")
+        if not expires_text.isdigit():
+            raise RuntimeError("invalid VM100 forced expiry")
+        tunnel_ip = require_tunnel_ip(tunnel_ip)
+        expires_epoch = int(expires_text)
+
+        group = groups.setdefault(
+            override_id,
+            {"selector": selector, "expires_epoch": expires_epoch, "tunnel_ips": []},
+        )
+        if group["selector"] != selector or group["expires_epoch"] != expires_epoch:
+            raise RuntimeError("inconsistent VM100 forced override group")
+        if tunnel_ip in group["tunnel_ips"]:
+            raise RuntimeError("duplicate VM100 forced override tunnel_ip")
+        group["tunnel_ips"].append(tunnel_ip)
+
+    if not accepted:
+        raise RuntimeError("VM100 forced-egress status did not return PASS")
+    for group in groups.values():
+        group["tunnel_ips"] = sorted(group["tunnel_ips"], key=ipaddress.ip_address)
+    return groups
+
+
+def remote_forced_status():
+    command = shlex.quote(REMOTE_FORCED_EGRESS_COMMAND) + " --status"
+    return parse_remote_forced_status(remote_command(command, log_output=False))
+
+
+def remote_forced_set_until(item):
+    args = [
+        REMOTE_FORCED_EGRESS_COMMAND,
+        "--set-until",
+        item["override_id"],
+        item["selector"],
+        str(item["expires_epoch"]),
+        *item["tunnel_ips"],
+    ]
+    command = " ".join(shlex.quote(str(value)) for value in args)
+    out = remote_command(command)
+    if "RESULT=PASS_FORCED_EGRESS_SET_UNTIL" not in out:
+        raise RuntimeError(
+            f"VM100 forced-egress set-until not accepted override={item['override_id']}"
+        )
+
+
+def remote_forced_clear(override_id):
+    command = " ".join(
+        shlex.quote(str(value))
+        for value in [REMOTE_FORCED_EGRESS_COMMAND, "--clear", override_id]
+    )
+    out = remote_command(command)
+    accepted = (
+        "RESULT=PASS_FORCED_EGRESS_CLEARED" in out
+        or "RESULT=NOOP_FORCED_EGRESS_ALREADY_AUTOMATIC" in out
+    )
+    if not accepted:
+        raise RuntimeError(
+            f"VM100 forced-egress clear not accepted override={override_id}"
+        )
+
+
+def routing_runtime_equivalent(current, desired):
+    return (
+        current.get("selector") == desired["selector"]
+        and current.get("expires_epoch") == desired["expires_epoch"]
+        and current.get("tunnel_ips") == desired["tunnel_ips"]
+    )
+
+
+def sync_routing_overrides():
+    desired = fetch_routing_overrides()
+    now_epoch = int(time.time())
+
+    # A desired row can age out between backend serialization and this agent
+    # cycle. Treat near-expiry rows as Automatic; VM100 remains protected by
+    # its own absolute nft timeout.
+    active_desired = {
+        override_id: item
+        for override_id, item in desired.items()
+        if item["expires_epoch"] > now_epoch + 2
+    }
+    current = remote_forced_status()
+
+    log(
+        "routing desired overrides="
+        f"{len(active_desired)} current_managed_overrides={len(current)}"
+    )
+
+    changed = False
+
+    # First remove managed runtime that is no longer desired. This covers
+    # Automatic, expiry, Configuration disablement, and configurations whose
+    # active variant set became empty.
+    for override_id in sorted(current):
+        item = active_desired.get(override_id)
+        if item is not None and item["tunnel_ips"]:
+            continue
+        remote_forced_clear(override_id)
+        changed = True
+        log(f"routing clear override={override_id}")
+
+    # Then converge every non-empty desired Configuration to one exact absolute
+    # deadline. Re-running this with the same expires_epoch never extends TTL.
+    for override_id in sorted(active_desired):
+        item = active_desired[override_id]
+        if not item["tunnel_ips"]:
+            continue
+        actual = current.get(override_id)
+        if actual is not None and routing_runtime_equivalent(actual, item):
+            continue
+        remote_forced_set_until(item)
+        changed = True
+        log(
+            f"routing set-until override={override_id} selector={item['selector']} "
+            f"expires_epoch={item['expires_epoch']} tunnel_ip_count={len(item['tunnel_ips'])}"
+        )
+
+    after = remote_forced_status() if changed else current
+    expected = {
+        override_id: {
+            "selector": item["selector"],
+            "expires_epoch": item["expires_epoch"],
+            "tunnel_ips": item["tunnel_ips"],
+        }
+        for override_id, item in active_desired.items()
+        if item["tunnel_ips"]
+    }
+
+    owned_after = {
+        override_id: value
+        for override_id, value in after.items()
+        if override_id.startswith(ROUTING_OVERRIDE_PREFIX)
+    }
+    if owned_after != expected:
+        raise RuntimeError(
+            "VM100 forced routing mismatch after reconcile "
+            f"expected={len(expected)} actual={len(owned_after)}"
+        )
+
+    state = load_state()
+    state["routing_overrides"] = {
+        override_id: {
+            "configuration_id": item["configuration_id"],
+            "selector": item["selector"],
+            "expires_epoch": item["expires_epoch"],
+            "tunnel_ips": item["tunnel_ips"],
+            "variant_count": len(item["variants"]),
+        }
+        for override_id, item in active_desired.items()
+    }
+    save_state(state)
+
+    log(
+        "routing reconcile complete "
+        f"desired={len(active_desired)} runtime={len(owned_after)} "
+        f"changed={1 if changed else 0}"
+    )
+    return active_desired, owned_after
+
+
+
 def resolve_job_protocol(job, *, expected_protocol):
     payload = job.get("payload_json") or {}
     payload_protocol = payload.get("protocol")
@@ -678,20 +946,33 @@ def process_pending_jobs(pending):
 
 
 def run_once():
-    # Fast path: durable jobs are user-visible work and must not wait behind a
-    # full all-peer reconcile. VM100 lifecycle remains the only runtime writer.
+    # Durable profile jobs stay first so a newly-active WG/AWG sibling can join
+    # an already-forced Configuration in this same agent invocation.
     pending = fetch_pending_jobs()
     if pending:
         process_pending_jobs(pending)
-        return 0
+    else:
+        # No due job exists: retain the existing desired-state reconcile as the
+        # periodic/fallback convergence mechanism. Unchanged peers are verified
+        # from one registry snapshot and do not receive redundant lifecycle --ensure.
+        log("no pending jobs; running fallback reconcile")
+        sync_enabled_peers()
 
-    # No due job exists: retain the existing desired-state reconcile as the
-    # periodic/fallback convergence mechanism. Unchanged peers are verified
-    # from one registry snapshot and do not receive redundant lifecycle --ensure.
-    log("no pending jobs; running fallback reconcile")
-    sync_enabled_peers()
+    # Configuration-level routing is desired state, not a provisioning job.
+    # Reconcile it every invocation so routing PUT wakeups are immediate while
+    # the timer remains the fallback convergence path.
+    sync_routing_overrides()
     return 0
 
 
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--routing-only":
+        sync_routing_overrides()
+        return 0
+    if len(sys.argv) != 1:
+        raise RuntimeError("usage: wg_access_agent.py [--routing-only]")
+    return run_once()
+
+
 if __name__ == "__main__":
-    sys.exit(run_once())
+    sys.exit(main())
