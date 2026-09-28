@@ -116,6 +116,13 @@ from app.services.domain_v2 import (
 from app.services.user_deletion import UserDeletionError, request_admin_user_deletion
 from app.services.runtime_snapshot import get_runtime_snapshot
 
+from app.services.routing_override import (
+    ConfigurationRoutingRejected,
+    ConfigurationRoutingUnavailable,
+    effective_configuration_routing,
+    set_owned_configuration_routing,
+)
+
 from app.services.profile_delivery import (
     ProfileNotReady,
     ProfileSurfaceError,
@@ -1870,7 +1877,15 @@ class ConfigurationSummary(BaseModel):
     label: str | None
     created_at: datetime
     updated_at: datetime
+    routing_mode: Literal["automatic", "forced"]
+    forced_selector: int | None
+    forced_until: datetime | None
     variants: list[ConfigurationVariantSummary]
+
+
+class ConfigurationRoutingUpdateRequest(BaseModel):
+    mode: Literal["automatic", "forced"]
+    selector: int | None = Field(default=None, ge=1, le=5)
 
 
 class ConfigurationCreateRequest(BaseModel):
@@ -1952,6 +1967,7 @@ def _configuration_summaries(
                     updated_at=profile.updated_at,
                 )
             )
+        routing = effective_configuration_routing(slot)
         result.append(
             ConfigurationSummary(
                 configuration_id=slot.id,
@@ -1960,6 +1976,9 @@ def _configuration_summaries(
                 label=slot.label,
                 created_at=slot.created_at,
                 updated_at=slot.updated_at,
+                routing_mode=routing.mode,
+                forced_selector=routing.selector,
+                forced_until=routing.expires_at,
                 variants=variants,
             )
         )
@@ -2067,6 +2086,50 @@ def account_configuration_update_label(
     except ProfileUnavailable as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail="configuration unavailable") from exc
+    summary = next(
+        (
+            row
+            for row in _configuration_summaries(db, user=user, include_disabled=True)
+            if row.configuration_id == configuration_id
+        ),
+        None,
+    )
+    if summary is None:
+        raise HTTPException(status_code=404, detail="configuration unavailable")
+    return summary
+
+
+@router.put(
+    "/account/profiles/configurations/{configuration_id}/routing",
+    response_model=ConfigurationSummary,
+)
+def account_configuration_update_routing(
+    configuration_id: UUID,
+    payload: ConfigurationRoutingUpdateRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    try:
+        set_owned_configuration_routing(
+            db,
+            user=user,
+            configuration_id=configuration_id,
+            mode=payload.mode,
+            selector=payload.selector,
+            request_id=_request_id(request),
+        )
+        db.commit()
+    except ConfigurationRoutingUnavailable as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="configuration unavailable") from exc
+    except ConfigurationRoutingRejected as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="routing mode is invalid") from exc
+
     summary = next(
         (
             row

@@ -195,6 +195,17 @@ class AuthSession(Base):
 
 class ConnectionSlot(Base):
     __tablename__ = "connection_slots"
+    __table_args__ = (
+        CheckConstraint(
+            "(forced_selector IS NULL AND forced_until IS NULL) OR "
+            "(forced_selector IS NOT NULL AND forced_until IS NOT NULL)",
+            name="connection_slots_forced_routing_shape",
+        ),
+        CheckConstraint(
+            "forced_selector IS NULL OR forced_selector BETWEEN 1 AND 5",
+            name="connection_slots_forced_selector_range",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Legacy rows may retain owner UUIDs whose users were historically deleted.
@@ -207,6 +218,8 @@ class ConnectionSlot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    forced_selector: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    forced_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class ConnectionProfile(Base):
