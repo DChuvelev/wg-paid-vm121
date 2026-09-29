@@ -1559,6 +1559,11 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
     if surface == "review":
         for summary in grant_summaries:
             summary.can_create_configuration = False
+            summary.protocol_limits = [
+                protocol_limit
+                for protocol_limit in summary.protocol_limits
+                if protocol_limit.protocol == "wireguard"
+            ]
             for protocol_limit in summary.protocol_limits:
                 protocol_limit.can_create = False
         referrals = ReferralCapabilitySummary(
