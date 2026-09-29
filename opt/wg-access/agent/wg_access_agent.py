@@ -58,6 +58,10 @@ REMOTE_FORCED_EGRESS_COMMAND = env.get(
     "REMOTE_FORCED_EGRESS_COMMAND",
     "/usr/local/sbin/router-wgpay-forced-egress.sh",
 )
+REMOTE_REVIEW_DIRECT_COMMAND = env.get(
+    "REMOTE_REVIEW_DIRECT_COMMAND",
+    "/usr/local/sbin/router-wgpay-review-direct.sh",
+)
 MANAGED_PROTOCOLS = ("wireguard", "amneziawg")
 ROUTING_OVERRIDE_PREFIX = "cfg:"
 
@@ -798,6 +802,106 @@ def sync_routing_overrides():
 
 
 
+def fetch_review_direct_desired():
+    query = parse.urlencode({"node_id": NODE_ID})
+    payload = http_json("GET", f"/agent/review-direct?{query}") or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("review Direct desired state must be an object")
+    raw = payload.get("tunnel_ips")
+    if not isinstance(raw, list):
+        raise RuntimeError("review Direct desired tunnel_ips must be a list")
+    desired = set()
+    for value in raw:
+        tunnel_ip = require_tunnel_ip(value)
+        if not (tunnel_ip.startswith("10.253.") or tunnel_ip.startswith("10.254.")):
+            raise RuntimeError("review Direct tunnel_ip is outside paid pools")
+        if tunnel_ip in desired:
+            raise RuntimeError("duplicate review Direct tunnel_ip")
+        desired.add(tunnel_ip)
+    return desired
+
+
+def parse_remote_review_direct_status(text):
+    accepted = False
+    current = set()
+    initialized = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "RESULT=PASS_REVIEW_DIRECT_STATUS":
+            accepted = True
+            continue
+        if line.startswith("initialized="):
+            initialized = line.split("=", 1)[1].strip().lower() == "true"
+            continue
+        if line.startswith("tunnel_ip="):
+            tunnel_ip = require_tunnel_ip(line.split("=", 1)[1])
+            if tunnel_ip in current:
+                raise RuntimeError("duplicate VM100 review Direct tunnel_ip")
+            current.add(tunnel_ip)
+    if not accepted:
+        raise RuntimeError("VM100 review Direct status did not return PASS")
+    return {"initialized": initialized, "tunnel_ips": current}
+
+
+def remote_review_direct_status():
+    command = shlex.quote(REMOTE_REVIEW_DIRECT_COMMAND) + " --status"
+    return parse_remote_review_direct_status(remote_command(command, log_output=False))
+
+
+def remote_review_direct_change(mode, tunnel_ips):
+    tunnel_ips = sorted(tunnel_ips, key=ipaddress.ip_address)
+    if not tunnel_ips:
+        return
+    args = [REMOTE_REVIEW_DIRECT_COMMAND, mode, *tunnel_ips]
+    command = " ".join(shlex.quote(str(value)) for value in args)
+    out = remote_command(command)
+    marker = {
+        "--add": "RESULT=PASS_REVIEW_DIRECT_ADDED",
+        "--remove": "RESULT=PASS_REVIEW_DIRECT_REMOVED",
+    }[mode]
+    if marker not in out:
+        raise RuntimeError(f"VM100 review Direct {mode} did not return PASS")
+
+
+def sync_review_direct():
+    desired = fetch_review_direct_desired()
+    current_state = remote_review_direct_status()
+    current = current_state["tunnel_ips"]
+    remove = current - desired
+    add = desired - current
+
+    log(
+        "review Direct desired="
+        f"{len(desired)} current={len(current)} add={len(add)} remove={len(remove)}"
+    )
+
+    # Remove stale membership before adding new membership. A failed add then
+    # fails closed to the normal selector/VPN path rather than granting Direct
+    # to an identity no longer desired by backend state.
+    if remove:
+        remote_review_direct_change("--remove", remove)
+    if add:
+        remote_review_direct_change("--add", add)
+
+    after = remote_review_direct_status() if (remove or add) else current_state
+    if after["tunnel_ips"] != desired:
+        raise RuntimeError(
+            "VM100 review Direct mismatch after reconcile "
+            f"expected={len(desired)} actual={len(after['tunnel_ips'])}"
+        )
+
+    state = load_state()
+    state["review_direct_tunnel_ips"] = sorted(desired, key=ipaddress.ip_address)
+    save_state(state)
+    log(
+        "review Direct reconcile complete "
+        f"desired={len(desired)} changed={1 if (remove or add) else 0}"
+    )
+    return desired, after["tunnel_ips"]
+
+
 def resolve_job_protocol(job, *, expected_protocol):
     payload = job.get("payload_json") or {}
     payload_protocol = payload.get("protocol")
@@ -962,6 +1066,7 @@ def run_once():
     # Reconcile it every invocation so routing PUT wakeups are immediate while
     # the timer remains the fallback convergence path.
     sync_routing_overrides()
+    sync_review_direct()
     return 0
 
 
@@ -969,8 +1074,11 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1] == "--routing-only":
         sync_routing_overrides()
         return 0
+    if len(sys.argv) == 2 and sys.argv[1] == "--review-direct-only":
+        sync_review_direct()
+        return 0
     if len(sys.argv) != 1:
-        raise RuntimeError("usage: wg_access_agent.py [--routing-only]")
+        raise RuntimeError("usage: wg_access_agent.py [--routing-only|--review-direct-only]")
     return run_once()
 
 

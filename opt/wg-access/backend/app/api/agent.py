@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.session import get_db
-from app.models import ConnectionProfile, ConnectionSlot, Peer, PeerCredential, ProvisioningJob
+from app.models import AccessGrant, ConnectionProfile, ConnectionSlot, Peer, PeerCredential, Plan, ProvisioningJob
 from app.services.user_deletion import finalize_user_deletion_if_ready
 from app.services.credential_service import CredentialServiceError, decrypt_profile_credential
 from app.services.runtime_snapshot import replace_runtime_snapshot
@@ -100,6 +100,38 @@ def get_enabled_peers(
         )
     return result
 
+
+YOOKASSA_REVIEW_PLAN_CODE = "yookassa-review"
+
+
+class AgentReviewDirectResponse(BaseModel):
+    tunnel_ips: list[str]
+
+
+@router.get("/review-direct", response_model=AgentReviewDirectResponse)
+def get_review_direct_desired(
+    node_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(check_agent_token),
+):
+    now = datetime.now(timezone.utc)
+    rows = db.execute(
+        select(ConnectionProfile.tunnel_ip)
+        .join(ConnectionSlot, ConnectionSlot.id == ConnectionProfile.connection_slot_id)
+        .join(AccessGrant, AccessGrant.id == ConnectionSlot.access_grant_id)
+        .join(Plan, Plan.id == AccessGrant.plan_id)
+        .where(Plan.code == YOOKASSA_REVIEW_PLAN_CODE)
+        .where(AccessGrant.status == "active")
+        .where(AccessGrant.valid_from <= now)
+        .where(or_(AccessGrant.valid_until.is_(None), AccessGrant.valid_until > now))
+        .where(ConnectionSlot.disabled_at.is_(None))
+        .where(ConnectionProfile.node_id == node_id)
+        .where(ConnectionProfile.status == "active")
+        .where(ConnectionProfile.tunnel_ip.is_not(None))
+        .order_by(ConnectionProfile.tunnel_ip.asc())
+    ).scalars().all()
+    tunnel_ips = sorted({str(value) for value in rows if value})
+    return AgentReviewDirectResponse(tunnel_ips=tunnel_ips)
 
 
 class AgentRoutingVariantResponse(BaseModel):
