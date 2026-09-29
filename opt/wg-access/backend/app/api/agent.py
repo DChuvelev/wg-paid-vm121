@@ -3,7 +3,7 @@ from uuid import UUID
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -325,10 +325,30 @@ class RuntimeSnapshotRowRequest(BaseModel):
     tx_bytes_per_second: float = Field(ge=0)
 
 
+class RuntimeExitCatalogEntryRequest(BaseModel):
+    selector: int = Field(ge=1, le=5)
+    display_name: str = Field(min_length=1, max_length=96)
+
+
+class RuntimeExitCatalogRequest(BaseModel):
+    generated_at: datetime
+    source_generation: str = Field(min_length=1, max_length=128)
+    confirm_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    exits: list[RuntimeExitCatalogEntryRequest] = Field(min_length=5, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_selectors(self):
+        selectors = [item.selector for item in self.exits]
+        if selectors != [1, 2, 3, 4, 5]:
+            raise ValueError("exit catalog selectors must be exactly 1..5")
+        return self
+
+
 class RuntimeSnapshotRequest(BaseModel):
     generated_at: datetime
     sample_interval_seconds: float = Field(gt=0, le=60)
     rows: list[RuntimeSnapshotRowRequest] = Field(max_length=10000)
+    exit_catalog: RuntimeExitCatalogRequest | None = None
 
 
 class RuntimeSnapshotAccepted(BaseModel):

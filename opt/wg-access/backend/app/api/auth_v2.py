@@ -1888,6 +1888,17 @@ class ConfigurationRoutingUpdateRequest(BaseModel):
     selector: int | None = Field(default=None, ge=1, le=5)
 
 
+class RoutingExitSummary(BaseModel):
+    selector: int = Field(ge=1, le=5)
+    display_name: str = Field(min_length=1, max_length=96)
+
+
+class RoutingExitCatalogResponse(BaseModel):
+    generated_at: datetime
+    observed_at: datetime
+    exits: list[RoutingExitSummary] = Field(min_length=5, max_length=5)
+
+
 class ConfigurationCreateRequest(BaseModel):
     grant_id: UUID
     label: str | None = Field(default=None, max_length=160)
@@ -2011,6 +2022,40 @@ def account_configurations(
 ):
     _, user = current
     return _configuration_summaries(db, user=user)
+
+
+@router.get(
+    "/account/profiles/routing-exits",
+    response_model=RoutingExitCatalogResponse,
+)
+def account_routing_exits(
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    _: None = Depends(_require_external_onboarding),
+):
+    del current
+    snapshot, received_at = get_runtime_snapshot()
+    if snapshot is None or received_at is None:
+        raise HTTPException(status_code=503, detail="routing exit catalog is unavailable")
+    age_seconds = max(0.0, (utcnow() - received_at).total_seconds())
+    if age_seconds > max(1, int(settings.runtime_snapshot_stale_seconds)):
+        raise HTTPException(status_code=503, detail="routing exit catalog is stale")
+    catalog = snapshot.get("exit_catalog")
+    if not isinstance(catalog, dict):
+        raise HTTPException(status_code=503, detail="routing exit catalog is unavailable")
+    raw_exits = catalog.get("exits")
+    if not isinstance(raw_exits, list) or len(raw_exits) != 5:
+        raise HTTPException(status_code=503, detail="routing exit catalog is unavailable")
+    exits = [RoutingExitSummary(**item) for item in raw_exits]
+    if [item.selector for item in exits] != [1, 2, 3, 4, 5]:
+        raise HTTPException(status_code=503, detail="routing exit catalog is unavailable")
+    generated_at = catalog.get("generated_at")
+    if not isinstance(generated_at, datetime):
+        raise HTTPException(status_code=503, detail="routing exit catalog is unavailable")
+    return RoutingExitCatalogResponse(
+        generated_at=generated_at,
+        observed_at=received_at,
+        exits=exits,
+    )
 
 
 @router.post(

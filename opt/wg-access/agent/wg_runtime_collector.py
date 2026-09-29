@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -97,6 +99,16 @@ printf '%s\\n' '__WG_END__'
 printf '%s\\n' '__AWG_BEGIN__'
 {awg_cli} show {awg_interface} dump | awk 'NR > 1 {{print $1 "\\t" $5 "\\t" $6 "\\t" $7}}'
 printf '%s\\n' '__AWG_END__'
+printf '%s\\n' '__EXIT_CATALOG_BEGIN__'
+if [ -x /usr/local/sbin/router-wgpay-exit-catalog.sh ]; then
+    /usr/local/sbin/router-wgpay-exit-catalog.sh --status || true
+else
+    printf '%s\\n' \
+        'schema=router-wgpay-exit-catalog-v1' \
+        'result=EMPTY' \
+        'reason=reader_missing'
+fi
+printf '%s\\n' '__EXIT_CATALOG_END__'
 """
     cmd = [
         "ssh",
@@ -201,6 +213,64 @@ def parse_wg(lines):
     return peers
 
 
+def parse_exit_catalog(lines):
+    values = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise RuntimeError("invalid exit catalog row")
+        key, value = line.split("=", 1)
+        if key in values:
+            raise RuntimeError("duplicate exit catalog key")
+        values[key] = value
+
+    if values.get("schema") != "router-wgpay-exit-catalog-v1":
+        raise RuntimeError("invalid exit catalog schema")
+    if values.get("result") == "EMPTY":
+        return None
+
+    expected = [
+        "schema",
+        "source_generation",
+        "generated_epoch",
+        "selector1",
+        "selector2",
+        "selector3",
+        "selector4",
+        "selector5",
+        "confirm_sha256",
+    ]
+    if list(values) != expected:
+        raise RuntimeError("invalid exit catalog shape")
+    generation = values["source_generation"]
+    if not generation or len(generation) > 128:
+        raise RuntimeError("invalid exit catalog generation")
+    generated_at = epoch_to_iso(values["generated_epoch"])
+    if generated_at is None:
+        raise RuntimeError("invalid exit catalog generated epoch")
+    confirm = values["confirm_sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", confirm):
+        raise RuntimeError("invalid exit catalog confirmation")
+    body = "".join(f"{key}={values[key]}\n" for key in expected[:-1]).encode("utf-8")
+    if hashlib.sha256(body).hexdigest() != confirm:
+        raise RuntimeError("exit catalog confirmation mismatch")
+
+    exits = []
+    for selector in range(1, 6):
+        display_name = values[f"selector{selector}"]
+        if not display_name or len(display_name) > 96:
+            raise RuntimeError("invalid exit catalog display name")
+        exits.append({"selector": selector, "display_name": display_name})
+    return {
+        "generated_at": generated_at,
+        "source_generation": generation,
+        "confirm_sha256": confirm,
+        "exits": exits,
+    }
+
+
 def true_value(value):
     return str(value).lower() == "true"
 
@@ -273,6 +343,7 @@ def build_payload(text, previous, previous_sample_monotonic, now_monotonic):
         "generated_at": iso_utc(utc_now()),
         "sample_interval_seconds": elapsed,
         "rows": rows,
+        "exit_catalog": parse_exit_catalog(framed_section(text, "EXIT_CATALOG")),
     }
     return payload, next_previous
 
