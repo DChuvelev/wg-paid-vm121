@@ -8,7 +8,7 @@ import hmac
 import secrets
 import time
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
@@ -72,6 +72,7 @@ from app.services.auth_v2 import (
     terminalize_terminal_bulk_campaign_children,
     user_reissue_referral_invite_token,
     user_revoke_referral_invite,
+    secret_token,
 )
 from app.services.billing import (
     BillingConflict,
@@ -104,6 +105,8 @@ from app.services.domain_v2 import (
     DomainV2Error,
     InvalidIdentity,
     PROFILE_QUOTA_STATUSES,
+    create_grant_from_plan,
+    ensure_verified_user,
     grant_is_active,
     logical_slot_count,
     mirrored_configuration_limit,
@@ -148,7 +151,31 @@ ADMIN_CSRF_HEADER = "x-admin-csrf-token"
 ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 GENERIC_LOGIN_RESPONSE = {"status": "accepted"}
 PROFILE_CONFIG_DOWNLOAD_VERSION = "v1"
+YOOKASSA_REVIEW_PLAN_CODE = "yookassa-review"
+YOOKASSA_REVIEW_EMAIL = "yookassa-review@secret-studio.ru"
+YOOKASSA_REVIEW_SOURCE_REF = "yookassa-review"
+YOOKASSA_REVIEW_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+YOOKASSA_REVIEW_PUBLIC_URL = "https://access.secret-studio.ru/auth/magic#review="
 logger = logging.getLogger(__name__)
+
+
+def _review_plan_codes(db: Session, *, user_id: UUID) -> set[str]:
+    return set(
+        db.execute(
+            select(Plan.code)
+            .join(AccessGrant, AccessGrant.plan_id == Plan.id)
+            .where(AccessGrant.user_id == user_id)
+        ).scalars().all()
+    )
+
+
+def _is_review_user(db: Session, *, user: User) -> bool:
+    return YOOKASSA_REVIEW_PLAN_CODE in _review_plan_codes(db, user_id=user.id)
+
+
+def _require_non_review_user(db: Session, *, user: User) -> None:
+    if _is_review_user(db, user=user):
+        raise HTTPException(status_code=404, detail="not found")
 
 
 def _deliver_magic_link_result(db: Session, *, result: MagicLinkIssueResult, request_id: str) -> bool:
@@ -497,6 +524,189 @@ class AdminInviteRequest(BaseModel):
     recipient_referrals_enabled: bool = True
     recipient_referral_limit: int = Field(default=3, ge=0)
     trial_days: int | None = Field(default=None, ge=1, le=30)
+
+
+class AdminReviewAccessResponse(BaseModel):
+    review_url: str
+    expires_at: datetime
+    user_id: UUID
+    grant_id: UUID
+    configuration_id: UUID
+    wireguard_profile_id: UUID
+    wireguard_status: str
+    wireguard_tunnel_ip: str | None
+    amneziawg_profile_id: UUID
+    amneziawg_status: str
+    amneziawg_tunnel_ip: str | None
+
+
+@router.post(
+    "/admin/review-access",
+    response_model=AdminReviewAccessResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_review_access(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    now = utcnow()
+    req = _request_id(request)
+    created_configuration = False
+    try:
+        plan = db.execute(
+            select(Plan).where(Plan.code == YOOKASSA_REVIEW_PLAN_CODE).with_for_update()
+        ).scalar_one_or_none()
+        if plan is None:
+            plan = Plan(
+                id=uuid4(),
+                code=YOOKASSA_REVIEW_PLAN_CODE,
+                display_name="YooKassa review",
+                active=True,
+                default_wireguard_limit=1,
+                default_amneziawg_limit=1,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(plan)
+            db.flush()
+        elif (
+            not plan.active
+            or int(plan.default_wireguard_limit) != 1
+            or int(plan.default_amneziawg_limit) != 1
+        ):
+            raise HTTPException(status_code=409, detail="review plan state is invalid")
+
+        user = ensure_verified_user(db, YOOKASSA_REVIEW_EMAIL, verified_at=now)
+        user.display_name = "YooKassa review"
+        user.referrals_enabled = False
+        user.referral_limit = 0
+
+        grant = db.execute(
+            select(AccessGrant)
+            .where(
+                AccessGrant.source_type == "review",
+                AccessGrant.source_ref == YOOKASSA_REVIEW_SOURCE_REF,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if grant is None:
+            grant = create_grant_from_plan(
+                db,
+                user=user,
+                plan=plan,
+                source_type="review",
+                source_ref=YOOKASSA_REVIEW_SOURCE_REF,
+                valid_from=now,
+                valid_until=None,
+            )
+        elif grant.user_id != user.id or grant.plan_id != plan.id or not grant_is_active(grant, now=now):
+            raise HTTPException(status_code=409, detail="review grant state is invalid")
+
+        slots = db.execute(
+            select(ConnectionSlot)
+            .where(
+                ConnectionSlot.user_id == user.id,
+                ConnectionSlot.access_grant_id == grant.id,
+                ConnectionSlot.disabled_at.is_(None),
+            )
+            .order_by(ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
+            .with_for_update()
+        ).scalars().all()
+        if len(slots) > 1:
+            raise HTTPException(status_code=409, detail="review configuration state is invalid")
+        if not slots:
+            result = create_owned_configuration(
+                db,
+                user=user,
+                grant_id=grant.id,
+                node_id=settings.wg_default_node_id,
+                label="Secret Studio review access",
+                request_id=req,
+                actor_kind="system",
+            )
+            slot = result.slot
+            created_configuration = True
+        else:
+            slot = slots[0]
+
+        profiles = db.execute(
+            select(ConnectionProfile)
+            .where(ConnectionProfile.connection_slot_id == slot.id)
+            .order_by(ConnectionProfile.protocol.asc())
+        ).scalars().all()
+        by_protocol = {row.protocol: row for row in profiles}
+        if set(by_protocol) != {"wireguard", "amneziawg"}:
+            raise HTTPException(status_code=409, detail="review profile mirror is invalid")
+
+        live_sessions = db.execute(
+            select(AuthSession)
+            .where(
+                AuthSession.user_id == user.id,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > now,
+            )
+            .with_for_update()
+        ).scalars().all()
+        for row in live_sessions:
+            row.revoked_at = now
+
+        token = secret_token()
+        expires_at = now + timedelta(seconds=YOOKASSA_REVIEW_SESSION_TTL_SECONDS)
+        db.add(
+            AuthSession(
+                id=uuid4(),
+                user_id=user.id,
+                token_hash=token.digest,
+                created_at=now,
+                expires_at=expires_at,
+                last_seen_at=None,
+                revoked_at=None,
+            )
+        )
+        record_audit_event(
+            db,
+            event_type="admin.review_access.reissued",
+            actor_kind="admin",
+            object_type="user",
+            object_id=str(user.id),
+            request_id=req,
+            payload={
+                "configuration_id": str(slot.id),
+                "created_configuration": created_configuration,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+        db.commit()
+        db.refresh(user)
+        db.refresh(grant)
+        db.refresh(slot)
+        for row in by_protocol.values():
+            db.refresh(row)
+    except HTTPException:
+        db.rollback()
+        raise
+    except (DomainV2Error, InvalidIdentity, ProfileSurfaceError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="review access cannot be prepared") from exc
+
+    if created_configuration:
+        trigger_wg_access_agent_best_effort()
+
+    wg = by_protocol["wireguard"]
+    awg = by_protocol["amneziawg"]
+    return AdminReviewAccessResponse(
+        review_url=f"{YOOKASSA_REVIEW_PUBLIC_URL}{token.raw}",
+        expires_at=expires_at,
+        user_id=user.id,
+        grant_id=grant.id,
+        configuration_id=slot.id,
+        wireguard_profile_id=wg.id,
+        wireguard_status=wg.status,
+        wireguard_tunnel_ip=wg.tunnel_ip,
+        amneziawg_profile_id=awg.id,
+        amneziawg_status=awg.status,
+        amneziawg_tunnel_ip=awg.tunnel_ip,
+    )
 
 
 class AdminInviteResponse(BaseModel):
@@ -1081,18 +1291,39 @@ def consume_magic_link_route(
             trigger_wg_access_agent_best_effort()
     except MagicLinkRejected as exc:
         db.rollback()
-        record_audit_event(
-            db,
-            event_type="auth.magic_link.rejected",
-            actor_kind="anonymous",
-            request_id=req,
-            payload={},
-        )
-        db.commit()
-        raise HTTPException(status_code=400, detail="invalid magic link") from exc
+        try:
+            review_session, review_user = authenticate_session(db, token=payload.token)
+            if not _is_review_user(db, user=review_user):
+                raise SessionRejected("not a review session")
+            review_session.last_seen_at = utcnow()
+            record_audit_event(
+                db,
+                event_type="auth.review_link.consumed",
+                actor_kind="user",
+                actor_user_id=review_user.id,
+                object_type="auth_session",
+                object_id=str(review_session.id),
+                request_id=req,
+                payload={},
+            )
+            db.commit()
+            session_token = payload.token
+        except SessionRejected:
+            db.rollback()
+            record_audit_event(
+                db,
+                event_type="auth.magic_link.rejected",
+                actor_kind="anonymous",
+                request_id=req,
+                payload={},
+            )
+            db.commit()
+            raise HTTPException(status_code=400, detail="invalid magic link") from exc
+    else:
+        session_token = result.token
 
     csrf_token = secrets.token_urlsafe(24)
-    _set_session_cookies(response, session_token=result.token, csrf_token=csrf_token)
+    _set_session_cookies(response, session_token=session_token, csrf_token=csrf_token)
     return {"status": "authenticated"}
 
 
@@ -1149,7 +1380,7 @@ class AccountMeResponse(BaseModel):
     user_id: UUID
     email: str
     display_name: str | None
-    account_surface: Literal["pilot", "commercial"]
+    account_surface: Literal["pilot", "commercial", "review"]
     grants: list[GrantSummary]
     billing: BillingAccountSummary | None
     referrals: ReferralCapabilitySummary
@@ -1249,14 +1480,17 @@ def _account_billing_summary(db: Session, *, user: User) -> BillingAccountSummar
     )
 
 
-def _account_surface(db: Session, *, user: User, grants: list[AccessGrant]) -> Literal["pilot", "commercial"]:
-    if db.execute(select(BillingAccount.id).where(BillingAccount.user_id == user.id)).scalar_one_or_none() is not None:
-        return "commercial"
+def _account_surface(db: Session, *, user: User, grants: list[AccessGrant]) -> Literal["pilot", "commercial", "review"]:
     plan_ids = {grant.plan_id for grant in grants if grant.plan_id is not None}
+    plan_codes: set[str] = set()
     if plan_ids:
         plan_codes = set(db.execute(select(Plan.code).where(Plan.id.in_(plan_ids))).scalars().all())
-        if TRUSTED_PILOT_PLAN_CODE in plan_codes:
-            return "pilot"
+    if YOOKASSA_REVIEW_PLAN_CODE in plan_codes:
+        return "review"
+    if db.execute(select(BillingAccount.id).where(BillingAccount.user_id == user.id)).scalar_one_or_none() is not None:
+        return "commercial"
+    if TRUSTED_PILOT_PLAN_CODE in plan_codes:
+        return "pilot"
     raise HTTPException(status_code=409, detail="account surface is unavailable")
 
 
@@ -1308,26 +1542,42 @@ def _account_me_response(db: Session, *, user: User) -> AccountMeResponse:
             for grant_id, count in usage_rows
         }
 
+    surface = _account_surface(db, user=user, grants=grants)
     billing = _account_billing_summary(db, user=user)
+    grant_summaries = [
+        _grant_summary(
+            db,
+            grant=g,
+            limits=limits_by_grant.get(g.id, []),
+            configuration_count=configuration_count_by_grant.get(g.id, 0),
+            configuration_limit_management=(
+                "billing" if billing is not None and g.id == billing.access_grant_id else "admin"
+            ),
+        )
+        for g in grants
+    ]
+    if surface == "review":
+        for summary in grant_summaries:
+            summary.can_create_configuration = False
+            for protocol_limit in summary.protocol_limits:
+                protocol_limit.can_create = False
+        referrals = ReferralCapabilitySummary(
+            enabled=False,
+            limit=0,
+            active_count=0,
+            remaining_count=0,
+            can_create=False,
+        )
+    else:
+        referrals = _account_referral_summary(db, user=user)
     return AccountMeResponse(
         user_id=user.id,
         email=user.email,
         display_name=user.display_name,
-        account_surface=_account_surface(db, user=user, grants=grants),
-        grants=[
-            _grant_summary(
-                db,
-                grant=g,
-                limits=limits_by_grant.get(g.id, []),
-                configuration_count=configuration_count_by_grant.get(g.id, 0),
-                configuration_limit_management=(
-                    "billing" if billing is not None and g.id == billing.access_grant_id else "admin"
-                ),
-            )
-            for g in grants
-        ],
+        account_surface=surface,
+        grants=grant_summaries,
         billing=billing,
-        referrals=_account_referral_summary(db, user=user),
+        referrals=referrals,
     )
 
 
@@ -1957,13 +2207,14 @@ def _configuration_summaries(
         for profile in profiles:
             profiles_by_slot.setdefault(profile.connection_slot_id, {})[profile.protocol] = profile
 
+    review_surface = _is_review_user(db, user=user)
     result: list[ConfigurationSummary] = []
     for ordinal, slot in enumerate(slots, start=1):
         if slot.disabled_at is not None and not include_disabled:
             continue
         variants: list[ConfigurationVariantSummary] = []
         by_protocol = profiles_by_slot.get(slot.id, {})
-        for protocol in ("wireguard", "amneziawg"):
+        for protocol in (("wireguard",) if review_surface else ("wireguard", "amneziawg")):
             profile = by_protocol.get(protocol)
             if profile is None:
                 continue
@@ -1987,9 +2238,9 @@ def _configuration_summaries(
                 label=slot.label,
                 created_at=slot.created_at,
                 updated_at=slot.updated_at,
-                routing_mode=routing.mode,
-                forced_selector=routing.selector,
-                forced_until=routing.expires_at,
+                routing_mode=("automatic" if review_surface else routing.mode),
+                forced_selector=(None if review_surface else routing.selector),
+                forced_until=(None if review_surface else routing.expires_at),
                 variants=variants,
             )
         )
@@ -2030,9 +2281,11 @@ def account_configurations(
 )
 def account_routing_exits(
     current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
     _: None = Depends(_require_external_onboarding),
 ):
-    del current
+    _, user = current
+    _require_non_review_user(db, user=user)
     snapshot, received_at = get_runtime_snapshot()
     if snapshot is None or received_at is None:
         raise HTTPException(status_code=503, detail="routing exit catalog is unavailable")
@@ -2072,6 +2325,7 @@ def account_configuration_create(
     __: None = Depends(_require_csrf),
 ):
     _, user = current
+    _require_non_review_user(db, user=user)
     try:
         result = create_owned_configuration(
             db,
@@ -2158,6 +2412,7 @@ def account_configuration_update_routing(
     __: None = Depends(_require_csrf),
 ):
     _, user = current
+    _require_non_review_user(db, user=user)
     try:
         set_owned_configuration_routing(
             db,
@@ -2203,6 +2458,7 @@ def account_profile_create(
     __: None = Depends(_require_csrf),
 ):
     _, user = current
+    _require_non_review_user(db, user=user)
     req = _request_id(request)
     try:
         result = create_owned_profile(
@@ -2272,6 +2528,8 @@ def account_profile_config_download_create(
         None,
     )
     if owned is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    if _is_review_user(db, user=user) and owned.protocol != "wireguard":
         raise HTTPException(status_code=404, detail="profile not found")
     if owned.protocol not in {"wireguard", "amneziawg"} or owned.status != "active" or not owned.tunnel_ip:
         raise HTTPException(status_code=409, detail="profile is not ready")
@@ -2351,6 +2609,13 @@ def account_profile_config(
     _: None = Depends(_require_external_onboarding),
 ):
     _, user = current
+    if _is_review_user(db, user=user):
+        owned = next(
+            (profile for profile in list_owned_profiles(db, user=user) if profile.id == profile_id),
+            None,
+        )
+        if owned is None or owned.protocol != "wireguard":
+            raise HTTPException(status_code=404, detail="profile not found")
     try:
         config_text = build_owned_profile_config(
             db,
@@ -2386,6 +2651,7 @@ def account_profile_qr(
     _: None = Depends(_require_external_onboarding),
 ):
     _, user = current
+    _require_non_review_user(db, user=user)
     try:
         config_text = build_owned_profile_config(
             db,
