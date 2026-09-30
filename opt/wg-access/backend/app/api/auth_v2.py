@@ -152,6 +152,8 @@ ADMIN_SESSION_TTL_SECONDS = 8 * 60 * 60
 GENERIC_LOGIN_RESPONSE = {"status": "accepted"}
 PROFILE_CONFIG_DOWNLOAD_VERSION = "v1"
 YOOKASSA_REVIEW_PLAN_CODE = "yookassa-review"
+YOOKASSA_REVIEW_OFFER_CODE = "yookassa-review-rub-v1"
+YOOKASSA_REVIEW_MONTHLY_KOPEKS = 29900
 YOOKASSA_REVIEW_EMAIL = "yookassa-review@secret-studio.ru"
 YOOKASSA_REVIEW_SOURCE_REF = "yookassa-review"
 YOOKASSA_REVIEW_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -531,13 +533,144 @@ class AdminReviewAccessResponse(BaseModel):
     expires_at: datetime
     user_id: UUID
     grant_id: UUID
-    configuration_id: UUID
-    wireguard_profile_id: UUID
+    configuration_id: UUID | None
+    wireguard_profile_id: UUID | None
     wireguard_status: str
     wireguard_tunnel_ip: str | None
-    amneziawg_profile_id: UUID
+    amneziawg_profile_id: UUID | None
     amneziawg_status: str
     amneziawg_tunnel_ip: str | None
+
+
+def _review_offer(db: Session, *, plan: Plan, now: datetime) -> BillingOffer:
+    matches = db.execute(
+        select(BillingOffer)
+        .where(
+            or_(
+                BillingOffer.code == YOOKASSA_REVIEW_OFFER_CODE,
+                BillingOffer.plan_id == plan.id,
+            )
+        )
+        .with_for_update()
+    ).scalars().all()
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="review billing offer state is invalid")
+    if not matches:
+        offer = BillingOffer(
+            id=uuid4(),
+            code=YOOKASSA_REVIEW_OFFER_CODE,
+            active=True,
+            currency="RUB",
+            base_slot_quantity=1,
+            base_monthly_kopeks=YOOKASSA_REVIEW_MONTHLY_KOPEKS,
+            extra_slot_monthly_kopeks=0,
+            trial_days=1,
+            max_slot_quantity=1,
+            active_referral_invite_limit=0,
+            plan_id=plan.id,
+            created_at=now,
+        )
+        db.add(offer)
+        db.flush()
+        return offer
+    offer = matches[0]
+    if (
+        offer.code != YOOKASSA_REVIEW_OFFER_CODE
+        or offer.plan_id != plan.id
+        or not offer.active
+        or offer.currency != "RUB"
+        or int(offer.base_slot_quantity) != 1
+        or int(offer.base_monthly_kopeks) != YOOKASSA_REVIEW_MONTHLY_KOPEKS
+        or int(offer.extra_slot_monthly_kopeks) != 0
+        or int(offer.trial_days) != 1
+        or int(offer.max_slot_quantity) != 1
+        or int(offer.active_referral_invite_limit) != 0
+    ):
+        raise HTTPException(status_code=409, detail="review billing offer state is invalid")
+    return offer
+
+
+def _review_billing_account(
+    db: Session,
+    *,
+    user: User,
+    grant: AccessGrant,
+    offer: BillingOffer,
+    active_slots: list[ConnectionSlot],
+    now: datetime,
+) -> BillingAccount:
+    matches = db.execute(
+        select(BillingAccount)
+        .where(
+            or_(
+                BillingAccount.user_id == user.id,
+                BillingAccount.access_grant_id == grant.id,
+            )
+        )
+        .with_for_update()
+    ).scalars().all()
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="review billing account state is invalid")
+    if not matches:
+        if active_slots:
+            raise HTTPException(
+                status_code=409,
+                detail="legacy review configuration must be reset before billing activation",
+            )
+        period_end = now - timedelta(days=1)
+        period_start = period_end - timedelta(days=1)
+        account = BillingAccount(
+            id=uuid4(),
+            user_id=user.id,
+            access_grant_id=grant.id,
+            offer_id=offer.id,
+            status="expired",
+            billing_mode="manual",
+            slot_quantity=1,
+            pending_slot_quantity=None,
+            quantity_period_start=period_start,
+            quantity_period_end=period_end,
+            pending_period_start=None,
+            pending_period_end=None,
+            current_period_start=period_start,
+            current_period_end=period_end,
+            grace_until=None,
+            payment_method_id=None,
+            cancel_at_period_end=False,
+            next_charge_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(account)
+        grant.status = "active"
+        grant.valid_from = period_start
+        grant.valid_until = period_end
+        grant.updated_at = now
+        db.flush()
+        return account
+
+    account = matches[0]
+    if (
+        account.user_id != user.id
+        or account.access_grant_id != grant.id
+        or account.offer_id != offer.id
+        or account.billing_mode != "manual"
+        or int(account.slot_quantity) != 1
+        or account.pending_slot_quantity is not None
+    ):
+        raise HTTPException(status_code=409, detail="review billing account state is invalid")
+    if account.status == "expired":
+        if active_slots:
+            raise HTTPException(status_code=409, detail="expired review account still has active configuration")
+        if grant_is_active(grant, now=now):
+            grant.valid_until = min(now, grant.valid_until or now)
+            grant.updated_at = now
+    elif account.status == "active_paid":
+        if not grant_is_active(grant, now=now) or len(active_slots) != 1:
+            raise HTTPException(status_code=409, detail="paid review runtime state is invalid")
+    else:
+        raise HTTPException(status_code=409, detail="review billing account state is invalid")
+    return account
 
 
 @router.post(
@@ -551,7 +684,6 @@ def admin_review_access(
 ):
     now = utcnow()
     req = _request_id(request)
-    created_configuration = False
     try:
         plan = db.execute(
             select(Plan).where(Plan.code == YOOKASSA_REVIEW_PLAN_CODE).with_for_update()
@@ -590,19 +722,21 @@ def admin_review_access(
             .with_for_update()
         ).scalar_one_or_none()
         if grant is None:
+            period_end = now - timedelta(days=1)
+            period_start = period_end - timedelta(days=1)
             grant = create_grant_from_plan(
                 db,
                 user=user,
                 plan=plan,
                 source_type="review",
                 source_ref=YOOKASSA_REVIEW_SOURCE_REF,
-                valid_from=now,
-                valid_until=None,
+                valid_from=period_start,
+                valid_until=period_end,
             )
-        elif grant.user_id != user.id or grant.plan_id != plan.id or not grant_is_active(grant, now=now):
+        elif grant.user_id != user.id or grant.plan_id != plan.id:
             raise HTTPException(status_code=409, detail="review grant state is invalid")
 
-        slots = db.execute(
+        active_slots = db.execute(
             select(ConnectionSlot)
             .where(
                 ConnectionSlot.user_id == user.id,
@@ -612,31 +746,43 @@ def admin_review_access(
             .order_by(ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
             .with_for_update()
         ).scalars().all()
-        if len(slots) > 1:
+        if len(active_slots) > 1:
             raise HTTPException(status_code=409, detail="review configuration state is invalid")
-        if not slots:
-            result = create_owned_configuration(
-                db,
-                user=user,
-                grant_id=grant.id,
-                node_id=settings.wg_default_node_id,
-                label="Secret Studio review access",
-                request_id=req,
-                actor_kind="system",
-            )
-            slot = result.slot
-            created_configuration = True
-        else:
-            slot = slots[0]
 
-        profiles = db.execute(
-            select(ConnectionProfile)
-            .where(ConnectionProfile.connection_slot_id == slot.id)
-            .order_by(ConnectionProfile.protocol.asc())
+        offer = _review_offer(db, plan=plan, now=now)
+        account = _review_billing_account(
+            db,
+            user=user,
+            grant=grant,
+            offer=offer,
+            active_slots=active_slots,
+            now=now,
+        )
+
+        slot = active_slots[0] if active_slots else None
+        by_protocol: dict[str, ConnectionProfile] = {}
+        if slot is not None:
+            profiles = db.execute(
+                select(ConnectionProfile)
+                .where(ConnectionProfile.connection_slot_id == slot.id)
+                .order_by(ConnectionProfile.protocol.asc())
+            ).scalars().all()
+            by_protocol = {row.protocol: row for row in profiles}
+            if set(by_protocol) != {"wireguard", "amneziawg"}:
+                raise HTTPException(status_code=409, detail="review profile mirror is invalid")
+
+        inflight = db.execute(
+            select(BillingPayment.status)
+            .where(
+                BillingPayment.billing_account_id == account.id,
+                BillingPayment.status.in_(("created", "pending")),
+            )
+            .order_by(BillingPayment.created_at.asc(), BillingPayment.id.asc())
+            .limit(2)
         ).scalars().all()
-        by_protocol = {row.protocol: row for row in profiles}
-        if set(by_protocol) != {"wireguard", "amneziawg"}:
-            raise HTTPException(status_code=409, detail="review profile mirror is invalid")
+        if len(inflight) > 1:
+            raise HTTPException(status_code=409, detail="review payment state is invalid")
+        unpaid_status = "payment_pending" if inflight else "payment_required"
 
         live_sessions = db.execute(
             select(AuthSession)
@@ -671,17 +817,20 @@ def admin_review_access(
             object_id=str(user.id),
             request_id=req,
             payload={
-                "configuration_id": str(slot.id),
-                "created_configuration": created_configuration,
+                "configuration_id": str(slot.id) if slot is not None else None,
+                "billing_account_id": str(account.id),
+                "billing_status": account.status,
                 "expires_at": expires_at.isoformat(),
             },
         )
         db.commit()
         db.refresh(user)
         db.refresh(grant)
-        db.refresh(slot)
-        for row in by_protocol.values():
-            db.refresh(row)
+        db.refresh(account)
+        if slot is not None:
+            db.refresh(slot)
+            for row in by_protocol.values():
+                db.refresh(row)
     except HTTPException:
         db.rollback()
         raise
@@ -689,8 +838,20 @@ def admin_review_access(
         db.rollback()
         raise HTTPException(status_code=409, detail="review access cannot be prepared") from exc
 
-    if created_configuration:
-        trigger_wg_access_agent_best_effort()
+    if slot is None:
+        return AdminReviewAccessResponse(
+            review_url=f"{YOOKASSA_REVIEW_PUBLIC_URL}{token.raw}",
+            expires_at=expires_at,
+            user_id=user.id,
+            grant_id=grant.id,
+            configuration_id=None,
+            wireguard_profile_id=None,
+            wireguard_status=unpaid_status,
+            wireguard_tunnel_ip=None,
+            amneziawg_profile_id=None,
+            amneziawg_status=unpaid_status,
+            amneziawg_tunnel_ip=None,
+        )
 
     wg = by_protocol["wireguard"]
     awg = by_protocol["amneziawg"]
