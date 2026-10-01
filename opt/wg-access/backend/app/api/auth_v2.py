@@ -542,6 +542,17 @@ class AdminReviewAccessResponse(BaseModel):
     amneziawg_tunnel_ip: str | None
 
 
+class AdminReviewResetResponse(BaseModel):
+    state: Literal["resetting", "payment_required"]
+    user_id: UUID
+    grant_id: UUID
+    billing_account_id: UUID
+    configuration_id: UUID | None
+    wireguard_status: str
+    amneziawg_status: str
+    retained_succeeded_payments: int
+
+
 def _review_offer(db: Session, *, plan: Plan, now: datetime) -> BillingOffer:
     matches = db.execute(
         select(BillingOffer)
@@ -867,6 +878,224 @@ def admin_review_access(
         amneziawg_profile_id=awg.id,
         amneziawg_status=awg.status,
         amneziawg_tunnel_ip=awg.tunnel_ip,
+    )
+
+
+@router.post(
+    "/admin/review-access/reset",
+    response_model=AdminReviewResetResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_review_access_reset(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Reset the isolated YooKassa reviewer back to a fresh unpaid cycle.
+
+    Payment history is retained. In-flight provider payments are never reset because
+    a late success could otherwise recreate entitlement after the admin reset.
+    Runtime retirement uses the normal Domain V2 disable lifecycle and therefore
+    may require repeated calls until both protocol siblings acknowledge disable.
+    """
+    now = utcnow()
+    req = _request_id(request)
+    agent_wakeup_needed = False
+    try:
+        user = db.execute(
+            select(User).where(User.email == YOOKASSA_REVIEW_EMAIL).with_for_update()
+        ).scalar_one_or_none()
+        if user is None:
+            raise HTTPException(status_code=409, detail="review access is not initialized")
+
+        plan = db.execute(
+            select(Plan).where(Plan.code == YOOKASSA_REVIEW_PLAN_CODE).with_for_update()
+        ).scalar_one_or_none()
+        if plan is None:
+            raise HTTPException(status_code=409, detail="review plan is not initialized")
+
+        grant = db.execute(
+            select(AccessGrant)
+            .where(
+                AccessGrant.source_type == "review",
+                AccessGrant.source_ref == YOOKASSA_REVIEW_SOURCE_REF,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if grant is None or grant.user_id != user.id or grant.plan_id != plan.id:
+            raise HTTPException(status_code=409, detail="review grant state is invalid")
+
+        offer = db.execute(
+            select(BillingOffer)
+            .where(BillingOffer.code == YOOKASSA_REVIEW_OFFER_CODE)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if (
+            offer is None
+            or offer.plan_id != plan.id
+            or not offer.active
+            or offer.currency != "RUB"
+            or int(offer.base_slot_quantity) != 1
+            or int(offer.base_monthly_kopeks) != YOOKASSA_REVIEW_MONTHLY_KOPEKS
+            or int(offer.extra_slot_monthly_kopeks) != 0
+            or int(offer.max_slot_quantity) != 1
+        ):
+            raise HTTPException(status_code=409, detail="review billing offer state is invalid")
+
+        account = db.execute(
+            select(BillingAccount)
+            .where(
+                BillingAccount.user_id == user.id,
+                BillingAccount.access_grant_id == grant.id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if (
+            account is None
+            or account.offer_id != offer.id
+            or account.billing_mode != "manual"
+            or int(account.slot_quantity) != 1
+        ):
+            raise HTTPException(status_code=409, detail="review billing account state is invalid")
+        if account.status not in {"active_paid", "expired"}:
+            raise HTTPException(status_code=409, detail="review billing account cannot be reset in this state")
+
+        inflight = db.execute(
+            select(BillingPayment)
+            .where(
+                BillingPayment.billing_account_id == account.id,
+                BillingPayment.status.in_(("created", "pending")),
+            )
+            .order_by(BillingPayment.created_at.asc(), BillingPayment.id.asc())
+            .with_for_update()
+        ).scalars().all()
+        if inflight:
+            raise HTTPException(status_code=409, detail="review payment is still pending")
+
+        succeeded_count = int(db.execute(
+            select(func.count(BillingPayment.id)).where(
+                BillingPayment.billing_account_id == account.id,
+                BillingPayment.status == "succeeded",
+            )
+        ).scalar_one())
+
+        active_slots = db.execute(
+            select(ConnectionSlot)
+            .where(
+                ConnectionSlot.user_id == user.id,
+                ConnectionSlot.access_grant_id == grant.id,
+                ConnectionSlot.disabled_at.is_(None),
+            )
+            .order_by(ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
+            .with_for_update()
+        ).scalars().all()
+        if len(active_slots) > 1:
+            raise HTTPException(status_code=409, detail="review configuration state is invalid")
+
+        slot = active_slots[0] if active_slots else None
+        by_protocol: dict[str, ConnectionProfile] = {}
+        if slot is not None:
+            profiles = db.execute(
+                select(ConnectionProfile)
+                .where(ConnectionProfile.connection_slot_id == slot.id)
+                .order_by(ConnectionProfile.protocol.asc())
+                .with_for_update()
+            ).scalars().all()
+            by_protocol = {row.protocol: row for row in profiles}
+            if set(by_protocol) != {"wireguard", "amneziawg"}:
+                raise HTTPException(status_code=409, detail="review profile mirror is invalid")
+
+        live_sessions = db.execute(
+            select(AuthSession)
+            .where(
+                AuthSession.user_id == user.id,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > now,
+            )
+            .with_for_update()
+        ).scalars().all()
+        for row in live_sessions:
+            row.revoked_at = now
+
+        if account.status == "active_paid":
+            reset_end = now - timedelta(seconds=1)
+            reset_start = reset_end - timedelta(days=1)
+            account.status = "expired"
+            account.pending_slot_quantity = None
+            account.quantity_period_start = reset_start
+            account.quantity_period_end = reset_end
+            account.pending_period_start = None
+            account.pending_period_end = None
+            account.current_period_start = reset_start
+            account.current_period_end = reset_end
+            account.grace_until = None
+            account.payment_method_id = None
+            account.cancel_at_period_end = False
+            account.next_charge_at = None
+            account.updated_at = now
+            grant.status = "active"
+            grant.valid_from = reset_start
+            grant.valid_until = reset_end
+            grant.updated_at = now
+            record_audit_event(
+                db,
+                event_type="admin.review_access.reset_started",
+                actor_kind="admin",
+                object_type="billing_account",
+                object_id=str(account.id),
+                request_id=req,
+                payload={
+                    "configuration_id": str(slot.id) if slot is not None else None,
+                    "retained_succeeded_payments": succeeded_count,
+                },
+            )
+
+        if slot is not None:
+            unfinished = [row for row in by_protocol.values() if row.status != "disabled"]
+            if unfinished:
+                if any(row.status != "disabling" for row in unfinished):
+                    request_configuration_disable(db, slot_id=slot.id)
+                    agent_wakeup_needed = True
+            else:
+                raise HTTPException(status_code=409, detail="review configuration disable state is inconsistent")
+
+        db.commit()
+        db.refresh(account)
+        db.refresh(grant)
+        if slot is not None:
+            db.refresh(slot)
+            for row in by_protocol.values():
+                db.refresh(row)
+    except HTTPException:
+        db.rollback()
+        raise
+    except (DomainV2Error, InvalidIdentity, ProfileSurfaceError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="review reset cannot be prepared") from exc
+
+    if agent_wakeup_needed:
+        trigger_wg_access_agent_best_effort()
+
+    if slot is None:
+        return AdminReviewResetResponse(
+            state="payment_required",
+            user_id=user.id,
+            grant_id=grant.id,
+            billing_account_id=account.id,
+            configuration_id=None,
+            wireguard_status="disabled",
+            amneziawg_status="disabled",
+            retained_succeeded_payments=succeeded_count,
+        )
+
+    return AdminReviewResetResponse(
+        state="resetting",
+        user_id=user.id,
+        grant_id=grant.id,
+        billing_account_id=account.id,
+        configuration_id=slot.id,
+        wireguard_status=by_protocol["wireguard"].status,
+        amneziawg_status=by_protocol["amneziawg"].status,
+        retained_succeeded_payments=succeeded_count,
     )
 
 
