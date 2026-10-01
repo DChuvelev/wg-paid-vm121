@@ -156,7 +156,7 @@ YOOKASSA_REVIEW_OFFER_CODE = "yookassa-review-rub-v1"
 YOOKASSA_REVIEW_MONTHLY_KOPEKS = 29900
 YOOKASSA_REVIEW_EMAIL = "yookassa-review@secret-studio.ru"
 YOOKASSA_REVIEW_SOURCE_REF = "yookassa-review"
-YOOKASSA_REVIEW_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+YOOKASSA_REVIEW_SESSION_TTL_SECONDS = 100 * 365 * 24 * 60 * 60
 YOOKASSA_REVIEW_PUBLIC_URL = "https://access.secret-studio.ru/auth/magic#review="
 logger = logging.getLogger(__name__)
 
@@ -795,12 +795,14 @@ def admin_review_access(
             raise HTTPException(status_code=409, detail="review payment state is invalid")
         unpaid_status = "payment_pending" if inflight else "payment_required"
 
+        # Reissuing is the explicit review-link rotation action. Because review
+        # links are reusable even after their historical expires_at, revoke every
+        # non-revoked review session here, not only currently unexpired rows.
         live_sessions = db.execute(
             select(AuthSession)
             .where(
                 AuthSession.user_id == user.id,
                 AuthSession.revoked_at.is_(None),
-                AuthSession.expires_at > now,
             )
             .with_for_update()
         ).scalars().all()
@@ -1004,17 +1006,8 @@ def admin_review_access_reset(
             if set(by_protocol) != {"wireguard", "amneziawg"}:
                 raise HTTPException(status_code=409, detail="review profile mirror is invalid")
 
-        live_sessions = db.execute(
-            select(AuthSession)
-            .where(
-                AuthSession.user_id == user.id,
-                AuthSession.revoked_at.is_(None),
-                AuthSession.expires_at > now,
-            )
-            .with_for_update()
-        ).scalars().all()
-        for row in live_sessions:
-            row.revoked_at = now
+        # A billing-cycle reset must not rotate or revoke the shared YooKassa
+        # review link. The same URL stays valid across repeated payment cycles.
 
         if account.status == "active_paid":
             reset_end = now - timedelta(seconds=1)
@@ -1682,10 +1675,23 @@ def consume_magic_link_route(
     except MagicLinkRejected as exc:
         db.rollback()
         try:
-            review_session, review_user = authenticate_session(db, token=payload.token)
-            if not _is_review_user(db, user=review_user):
+            review_digest = hashlib.sha256(str(payload.token or "").encode("utf-8")).hexdigest()
+            review_session = db.execute(
+                select(AuthSession)
+                .where(
+                    AuthSession.token_hash == review_digest,
+                    AuthSession.revoked_at.is_(None),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if review_session is None:
                 raise SessionRejected("not a review session")
-            review_session.last_seen_at = utcnow()
+            review_user = db.get(User, review_session.user_id)
+            if review_user is None or not _is_review_user(db, user=review_user):
+                raise SessionRejected("not a review session")
+            review_now = utcnow()
+            review_session.last_seen_at = review_now
+            review_session.expires_at = review_now + timedelta(seconds=YOOKASSA_REVIEW_SESSION_TTL_SECONDS)
             record_audit_event(
                 db,
                 event_type="auth.review_link.consumed",
@@ -2465,7 +2471,13 @@ def logout(
     __: None = Depends(_require_csrf),
 ):
     session, user = current
-    revoke_session(db, session=session, user=user, request_id=_request_id(request))
+    if _is_review_user(db, user=user):
+        # The YooKassa review URL is a shared reusable credential. Logout only
+        # clears this browser's cookies; it must not revoke the shared link for
+        # other reviewers or prevent the same URL from being opened again.
+        session.last_seen_at = utcnow()
+    else:
+        revoke_session(db, session=session, user=user, request_id=_request_id(request))
     db.commit()
     _clear_session_cookies(response)
     response.status_code = status.HTTP_204_NO_CONTENT
