@@ -30,6 +30,18 @@ class YooKassaCredentials:
     secret_key: str
 
 
+RECEIPT_VAT_CODE = 1  # Без НДС.
+RECEIPT_PAYMENT_SUBJECT = "service"
+RECEIPT_MEASURE = "piece"
+_RECEIPT_LINE_RULES: dict[str, tuple[str, str]] = {
+    "reactivation_period": ("Доступ к VPN Secret Studio — 1 месяц", "full_payment"),
+    "current_proration": ("Доступ к VPN Secret Studio — доплата за текущий период", "full_payment"),
+    "next_period": ("Доступ к VPN Secret Studio — следующий месяц", "full_prepayment"),
+    "next_period_top_up": ("Доступ к VPN Secret Studio — доплата за следующий месяц", "full_prepayment"),
+}
+_PREPAYMENT_LINE_KINDS = frozenset({"next_period", "next_period_top_up"})
+
+
 def _load_credentials() -> YooKassaCredentials:
     path = Path(settings.yookassa_credentials_file)
     try:
@@ -70,12 +82,12 @@ def _request_json(
     headers = {
         "Authorization": _authorization_header(credentials),
         "Accept": "application/json",
-        "User-Agent": "SecretStudio-P29D/1",
+        "User-Agent": "SecretStudio-P29H/1",
     }
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
-        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if idempotence_key is not None:
         headers["Idempotence-Key"] = idempotence_key
     request = urllib.request.Request(
@@ -113,6 +125,74 @@ def _request_json(
     return result
 
 
+def _money_value(amount_kopeks: int) -> str:
+    amount = int(amount_kopeks)
+    if amount <= 0:
+        raise YooKassaRejected("receipt amount must be positive")
+    return f"{amount // 100}.{amount % 100:02d}"
+
+
+def _receipt_line(line: dict[str, Any], *, currency: str, force_full_payment: bool = False) -> dict[str, Any]:
+    kind = str(line.get("kind") or "")
+    rule = _RECEIPT_LINE_RULES.get(kind)
+    if rule is None:
+        raise YooKassaRejected(f"unsupported receipt calculation line: {kind or 'missing'}")
+    description, payment_mode = rule
+    if force_full_payment:
+        if kind not in _PREPAYMENT_LINE_KINDS:
+            raise YooKassaRejected("only a prepayment line can be settled")
+        payment_mode = "full_payment"
+    amount_kopeks = int(line.get("amount_kopeks") or 0)
+    return {
+        "description": description,
+        "quantity": 1.0,
+        "amount": {"value": _money_value(amount_kopeks), "currency": currency},
+        "vat_code": RECEIPT_VAT_CODE,
+        "payment_mode": payment_mode,
+        "payment_subject": RECEIPT_PAYMENT_SUBJECT,
+        "measure": RECEIPT_MEASURE,
+    }
+
+
+def _payment_receipt(
+    *,
+    customer_email: str,
+    currency: str,
+    amount_kopeks: int,
+    calculation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    email = str(customer_email or "").strip()
+    if not email or "@" not in email:
+        raise YooKassaRejected("receipt customer email is unavailable")
+    if not isinstance(calculation, dict):
+        raise YooKassaRejected("receipt calculation is unavailable")
+    contract = calculation.get("receipt_contract")
+    if not isinstance(contract, dict) or not (
+        int(contract.get("version") or 0) == 1
+        and str(contract.get("provider") or "") == "yookassa"
+        and str(contract.get("provider_mode") or "") == "live"
+        and int(contract.get("vat_code") or 0) == RECEIPT_VAT_CODE
+    ):
+        raise YooKassaRejected("live receipt contract is unavailable")
+    raw_lines = calculation.get("lines")
+    if not isinstance(raw_lines, list) or not raw_lines:
+        raise YooKassaRejected("receipt calculation lines are unavailable")
+    items: list[dict[str, Any]] = []
+    total = 0
+    for raw_line in raw_lines:
+        if not isinstance(raw_line, dict):
+            raise YooKassaRejected("receipt calculation line is invalid")
+        total += int(raw_line.get("amount_kopeks") or 0)
+        items.append(_receipt_line(raw_line, currency=currency))
+    if total != int(amount_kopeks):
+        raise YooKassaRejected("receipt total does not match payment amount")
+    return {
+        "customer": {"email": email},
+        "items": items,
+        "internet": True,
+    }
+
+
 def create_payment(
     *,
     idempotence_key: str,
@@ -122,8 +202,10 @@ def create_payment(
     billing_payment_id: str,
     billing_account_id: str,
     kind: str,
+    customer_email: str,
+    calculation: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    value = f"{int(amount_kopeks) // 100}.{int(amount_kopeks) % 100:02d}"
+    value = _money_value(amount_kopeks)
     return _request_json(
         method="POST",
         path="/v3/payments",
@@ -137,11 +219,54 @@ def create_payment(
             },
             "description": description,
             "save_payment_method": False,
+            "receipt": _payment_receipt(
+                customer_email=customer_email,
+                currency=currency,
+                amount_kopeks=amount_kopeks,
+                calculation=calculation,
+            ),
             "metadata": {
                 "billing_payment_id": billing_payment_id,
                 "billing_account_id": billing_account_id,
                 "kind": kind,
             },
+        },
+    )
+
+
+def create_prepayment_settlement_receipt(
+    *,
+    idempotence_key: str,
+    provider_payment_id: str,
+    customer_email: str,
+    currency: str,
+    calculation_line: dict[str, Any],
+) -> dict[str, Any]:
+    provider_id = str(provider_payment_id or "").strip()
+    if not provider_id or "/" in provider_id:
+        raise YooKassaRejected("invalid YooKassa payment id")
+    email = str(customer_email or "").strip()
+    if not email or "@" not in email:
+        raise YooKassaRejected("receipt customer email is unavailable")
+    item = _receipt_line(calculation_line, currency=currency, force_full_payment=True)
+    amount = item["amount"]
+    return _request_json(
+        method="POST",
+        path="/v3/receipts",
+        idempotence_key=idempotence_key,
+        body={
+            "type": "payment",
+            "payment_id": provider_id,
+            "customer": {"email": email},
+            "send": True,
+            "items": [item],
+            "internet": True,
+            "settlements": [
+                {
+                    "type": "prepayment",
+                    "amount": {"value": amount["value"], "currency": amount["currency"]},
+                }
+            ],
         },
     )
 

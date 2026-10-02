@@ -2123,6 +2123,8 @@ def account_billing_payment_create(
             billing_payment_id=str(payment.id),
             billing_account_id=str(payment.billing_account_id),
             kind=payment.kind,
+            customer_email=user.email,
+            calculation=payment.calculation_json,
         )
         payment = bind_provider_create_response(
             db,

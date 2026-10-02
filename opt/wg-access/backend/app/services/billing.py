@@ -14,6 +14,7 @@ from app.config import settings
 from app.models import (
     AccessGrant,
     AccessGrantProtocolLimit,
+    AuditEvent,
     BillingAccount,
     BillingOffer,
     BillingPayment,
@@ -32,7 +33,7 @@ from app.services.domain_v2 import (
     request_configuration_disable,
     utcnow,
 )
-from app.services.yookassa import get_payment
+from app.services.yookassa import create_prepayment_settlement_receipt, get_payment
 
 
 _IDEMPOTENCE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -617,6 +618,12 @@ def prepare_manual_payment_intent(
         "planned_configuration_ids": [str(value) for value in planned_new_ids],
         "retire_configuration_ids": [str(value) for value in selected],
         "retire_new_configuration_ordinals": selected_new_ordinals,
+        "receipt_contract": {
+            "version": 1,
+            "provider": "yookassa",
+            "provider_mode": "live",
+            "vat_code": 1,
+        },
         "lines": lines,
     }
 
@@ -1308,6 +1315,109 @@ def reconcile_payment(
     )
     db.flush()
     return ReconcileResult(payment=payment, state_changed=True, configuration=configuration)
+
+
+def _live_receipt_contract(calculation: dict[str, object]) -> bool:
+    contract = calculation.get("receipt_contract")
+    if not isinstance(contract, dict):
+        return False
+    return (
+        int(contract.get("version") or 0) == 1
+        and str(contract.get("provider") or "") == "yookassa"
+        and str(contract.get("provider_mode") or "") == "live"
+        and int(contract.get("vat_code") or 0) == 1
+    )
+
+
+def settle_due_prepayment_receipts(
+    db: Session,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Register closing receipts for live YooKassa prepayments whose service has started.
+
+    Historical test-store payments deliberately lack receipt_contract and are ignored.
+    A durable audit marker prevents ordinary replay; uncertain provider outcomes always
+    reuse the same deterministic YooKassa Idempotence-Key.
+    """
+    point = now or utcnow()
+    payments = list(
+        db.execute(
+            select(BillingPayment)
+            .where(
+                BillingPayment.status == "succeeded",
+                BillingPayment.provider_payment_id.is_not(None),
+            )
+            .order_by(BillingPayment.created_at.asc(), BillingPayment.id.asc())
+        ).scalars().all()
+    )
+    settled = 0
+    for payment in payments:
+        calculation = payment.calculation_json
+        if not isinstance(calculation, dict) or not _live_receipt_contract(calculation):
+            continue
+        account = db.get(BillingAccount, payment.billing_account_id)
+        if account is None:
+            raise BillingConflict("fiscal payment billing account is unavailable")
+        user = db.get(User, account.user_id)
+        if user is None:
+            raise BillingConflict("fiscal payment user is unavailable")
+        lines = calculation.get("lines")
+        if not isinstance(lines, list):
+            raise BillingConflict("fiscal payment calculation lines are unavailable")
+        for index, line in enumerate(lines):
+            if not isinstance(line, dict):
+                raise BillingConflict("fiscal payment calculation line is invalid")
+            if str(line.get("kind") or "") not in {"next_period", "next_period_top_up"}:
+                continue
+            line_start = _parse_calc_datetime(
+                line.get("period_start"),
+                field="receipt_period_start",
+            )
+            if line_start is None or line_start > point:
+                continue
+            marker_id = f"{payment.id}:{index}"
+            existing = db.execute(
+                select(AuditEvent.id).where(
+                    AuditEvent.event_type == "billing.receipt.prepayment_settled",
+                    AuditEvent.object_type == "billing_payment_line",
+                    AuditEvent.object_id == marker_id,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                continue
+            receipt = create_prepayment_settlement_receipt(
+                idempotence_key=f"p29h-settle-{payment.id.hex}-{index}",
+                provider_payment_id=str(payment.provider_payment_id),
+                customer_email=user.email,
+                currency=payment.currency,
+                calculation_line=line,
+            )
+            receipt_id = str(receipt.get("id") or "")
+            if not receipt_id:
+                raise BillingProviderMismatch("YooKassa closing receipt id is missing")
+            record_audit_event(
+                db,
+                event_type="billing.receipt.prepayment_settled",
+                actor_kind="system",
+                actor_user_id=user.id,
+                object_type="billing_payment_line",
+                object_id=marker_id,
+                payload={
+                    "billing_payment_id": str(payment.id),
+                    "line_index": index,
+                    "line_kind": str(line.get("kind") or ""),
+                    "period_start": _iso(line_start),
+                    "provider_payment_id": str(payment.provider_payment_id),
+                    "receipt_id": receipt_id,
+                    "receipt_status": str(receipt.get("status") or ""),
+                    "idempotence_key": f"p29h-settle-{payment.id.hex}-{index}",
+                },
+            )
+            settled += 1
+    db.flush()
+    return settled
+
 
 @dataclass(frozen=True)
 class QuantityTransitionResult:

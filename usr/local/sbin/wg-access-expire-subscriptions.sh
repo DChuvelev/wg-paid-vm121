@@ -59,7 +59,7 @@ from app.services.domain_v2 import (
     record_audit_event,
     request_configuration_disable,
 )
-from app.services.billing import apply_due_quantity_transitions
+from app.services.billing import apply_due_quantity_transitions, settle_due_prepayment_receipts
 
 EXPECTED_PROTOCOLS = {"wireguard", "amneziawg"}
 MODE = os.environ.get("WG_ACCESS_EXPIRY_MODE", "run")
@@ -304,9 +304,15 @@ def main():
         quantity_configurations_created = 0
         quantity_retirements_requested = 0
         quantity_wakeup = False
+        prepayment_receipts_settled = 0
 
         if MODE == "run":
+            # Entitlement transition is local authority and must not depend on a
+            # transient receipt-provider call. Commit it first; the fiscal pass
+            # is independently idempotent and will retry on the next timer run.
             quantity_results = apply_due_quantity_transitions(db, now=now)
+            db.commit()
+            prepayment_receipts_settled = settle_due_prepayment_receipts(db, now=now)
             db.commit()
             quantity_transitions_applied = len(quantity_results)
             quantity_configurations_created = sum(int(item.configurations_created) for item in quantity_results)
@@ -365,6 +371,7 @@ def main():
             trigger_wg_access_agent_best_effort()
 
         print(f"QUANTITY_TRANSITIONS_APPLIED={quantity_transitions_applied}")
+        print(f"PREPAYMENT_RECEIPTS_SETTLED={prepayment_receipts_settled}")
         print(f"QUANTITY_CONFIGURATIONS_CREATED={quantity_configurations_created}")
         print(f"QUANTITY_RETIREMENTS_REQUESTED={quantity_retirements_requested}")
         print(f"GRANTS_EXPIRED={grants_expired}")
