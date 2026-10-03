@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import base64
 import json
 from pathlib import Path
+import re
 import socket
 from typing import Any
 import urllib.error
@@ -34,12 +35,26 @@ RECEIPT_VAT_CODE = 1  # Без НДС.
 RECEIPT_PAYMENT_SUBJECT = "service"
 RECEIPT_MEASURE = "piece"
 _RECEIPT_LINE_RULES: dict[str, tuple[str, str]] = {
-    "reactivation_period": ("Доступ к VPN Secret Studio — 1 месяц", "full_payment"),
-    "current_proration": ("Доступ к VPN Secret Studio — доплата за текущий период", "full_payment"),
-    "next_period": ("Доступ к VPN Secret Studio — следующий месяц", "full_prepayment"),
-    "next_period_top_up": ("Доступ к VPN Secret Studio — доплата за следующий месяц", "full_prepayment"),
+    "reactivation_period": ("Secret Studio — доступ на 1 месяц", "full_payment"),
+    "current_proration": ("Secret Studio — доплата за текущий период", "full_payment"),
+    "next_period": ("Secret Studio — доступ на следующий месяц", "full_prepayment"),
+    "next_period_top_up": ("Secret Studio — доплата за следующий месяц", "full_prepayment"),
 }
 _PREPAYMENT_LINE_KINDS = frozenset({"next_period", "next_period_top_up"})
+_FORBIDDEN_CUSTOMER_PAYMENT_PATTERNS = tuple(
+    re.compile(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", re.IGNORECASE)
+    for token in ("VPN", "WireGuard", "AmneziaWG", "Amnezia", "AWG", "WG")
+)
+
+
+def _assert_customer_facing_text_safe(value: str, *, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise YooKassaRejected(f"customer-facing payment text is empty: {field}")
+    for pattern in _FORBIDDEN_CUSTOMER_PAYMENT_PATTERNS:
+        if pattern.search(text):
+            raise YooKassaRejected(f"forbidden customer-facing payment term: {field}")
+    return text
 
 
 def _load_credentials() -> YooKassaCredentials:
@@ -138,6 +153,7 @@ def _receipt_line(line: dict[str, Any], *, currency: str, force_full_payment: bo
     if rule is None:
         raise YooKassaRejected(f"unsupported receipt calculation line: {kind or 'missing'}")
     description, payment_mode = rule
+    description = _assert_customer_facing_text_safe(description, field=f"receipt.{kind}.description")
     if force_full_payment:
         if kind not in _PREPAYMENT_LINE_KINDS:
             raise YooKassaRejected("only a prepayment line can be settled")
@@ -206,6 +222,7 @@ def create_payment(
     calculation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     value = _money_value(amount_kopeks)
+    public_description = _assert_customer_facing_text_safe(description, field="payment.description")
     return _request_json(
         method="POST",
         path="/v3/payments",
@@ -217,7 +234,7 @@ def create_payment(
                 "type": "redirect",
                 "return_url": settings.yookassa_return_url,
             },
-            "description": description,
+            "description": public_description,
             "save_payment_method": False,
             "receipt": _payment_receipt(
                 customer_email=customer_email,
