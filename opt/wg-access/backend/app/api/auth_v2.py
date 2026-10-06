@@ -3185,10 +3185,22 @@ class AdminUserSummary(BaseModel):
     profiles: list[ProfileSummary]
 
 
+class AdminInvitationSourceOption(BaseModel):
+    origin: Literal["user", "campaign"]
+    source_id: UUID
+    label: str
+    secondary_label: str | None
+    created_at: datetime
+
+
 class AdminRuntimeConnectionRow(BaseModel):
     user_id: UUID
     email: str
     display_name: str | None
+    invited_by_origin: Literal["admin", "user", "campaign"] | None
+    invited_by_user_id: UUID | None
+    invited_by_label: str | None
+    invited_by_campaign_id: UUID | None
     configuration_id: UUID
     configuration_ordinal: int
     configuration_label: str | None
@@ -3382,6 +3394,54 @@ def _admin_bulk_invite_summary(campaign: BulkInviteCampaign, *, now: datetime | 
         created_at=campaign.created_at,
         state=bulk_invite_campaign_state(campaign, now=now),
     )
+
+
+def _admin_registration_ranked_subquery():
+    return (
+        select(
+            InviteRedemption.user_id.label("user_id"),
+            InviteRedemption.invite_id.label("invite_id"),
+            InviteRedemption.redeemed_at.label("redeemed_at"),
+            func.row_number().over(
+                partition_by=InviteRedemption.user_id,
+                order_by=(InviteRedemption.redeemed_at.asc(), InviteRedemption.id.asc()),
+            ).label("registration_rank"),
+        )
+        .subquery()
+    )
+
+
+def _admin_invited_by_origin(invite: Invite | None) -> Literal["admin", "user", "campaign"] | None:
+    if invite is None:
+        return None
+    if invite.bulk_campaign_id is not None:
+        return "campaign"
+    if invite.created_by_kind == "user":
+        return "user"
+    return "admin"
+
+
+def _admin_registration_invites_by_user_ids(
+    db: Session,
+    *,
+    user_ids: set[UUID],
+) -> dict[UUID, Invite]:
+    if not user_ids:
+        return {}
+    registration_ranked = _admin_registration_ranked_subquery()
+    rows = db.execute(
+        select(registration_ranked.c.user_id, Invite)
+        .join(Invite, Invite.id == registration_ranked.c.invite_id)
+        .where(
+            registration_ranked.c.registration_rank == 1,
+            registration_ranked.c.user_id.in_(user_ids),
+        )
+    ).all()
+    return {user_id: invite for user_id, invite in rows}
+
+
+def _admin_lookup_tokens(query: str | None) -> list[str]:
+    return [token for token in str(query or "").strip().casefold().split() if token]
 
 
 def _admin_grant_summaries(db: Session, *, user: User) -> list[GrantSummary]:
@@ -3909,6 +3969,84 @@ def admin_profile_config_download(
 
 
 @router.get(
+    "/admin/invitation-sources",
+    response_model=list[AdminInvitationSourceOption],
+    dependencies=[Depends(_require_admin)],
+)
+def admin_invitation_sources(
+    origin: Literal["user", "campaign"],
+    query: str | None = None,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+):
+    bounded_limit = min(max(int(limit), 1), 50)
+    tokens = _admin_lookup_tokens(query)
+
+    if origin == "user":
+        inviter_exists = (
+            select(Invite.id)
+            .where(
+                Invite.created_by_user_id == User.id,
+                Invite.created_by_kind == "user",
+                Invite.bulk_campaign_id.is_(None),
+            )
+            .exists()
+        )
+        stmt = select(User).where(inviter_exists)
+        for token in tokens:
+            stmt = stmt.where(
+                or_(
+                    func.lower(User.email).contains(token, autoescape=True),
+                    func.lower(User.display_name).contains(token, autoescape=True),
+                )
+            )
+        users = db.execute(
+            stmt.order_by(
+                func.lower(func.coalesce(User.display_name, User.email)).asc(),
+                func.lower(User.email).asc(),
+                User.id.asc(),
+            ).limit(bounded_limit)
+        ).scalars().all()
+        result: list[AdminInvitationSourceOption] = []
+        for user in users:
+            display_name = str(user.display_name or "").strip()
+            label = display_name or user.email
+            result.append(
+                AdminInvitationSourceOption(
+                    origin="user",
+                    source_id=user.id,
+                    label=label,
+                    secondary_label=user.email if display_name else None,
+                    created_at=user.created_at,
+                )
+            )
+        return result
+
+    stmt = select(BulkInviteCampaign)
+    for token in tokens:
+        stmt = stmt.where(
+            func.lower(BulkInviteCampaign.label).contains(token, autoescape=True)
+        )
+    campaigns = db.execute(
+        stmt.order_by(
+            func.lower(BulkInviteCampaign.label).asc(),
+            BulkInviteCampaign.created_at.desc(),
+            BulkInviteCampaign.id.asc(),
+        ).limit(bounded_limit)
+    ).scalars().all()
+    return [
+        AdminInvitationSourceOption(
+            origin="campaign",
+            source_id=campaign.id,
+            label=campaign.label,
+            secondary_label=None,
+            created_at=campaign.created_at,
+        )
+        for campaign in campaigns
+    ]
+
+
+@router.get(
     "/admin/runtime/connections",
     response_model=AdminRuntimeConnectionsResponse,
     dependencies=[Depends(_require_admin)],
@@ -3947,6 +4085,7 @@ def admin_runtime_connections(db: Session = Depends(get_db)):
         .order_by(ConnectionSlot.user_id.asc(), ConnectionSlot.created_at.asc(), ConnectionSlot.id.asc())
     ).scalars().all() if user_ids else []
     slots_by_id = {slot.id: slot for slot in slots}
+    registration_invites = _admin_registration_invites_by_user_ids(db, user_ids=user_ids)
     slot_ordinals: dict[UUID, int] = {}
     ordinal_by_user: dict[UUID, int] = {}
     for slot in slots:
@@ -3972,10 +4111,21 @@ def admin_runtime_connections(db: Session = Depends(get_db)):
         ):
             unmatched += 1
             continue
+        registration_invite = registration_invites.get(user.id)
         rows.append(AdminRuntimeConnectionRow(
             user_id=user.id,
             email=user.email,
             display_name=user.display_name,
+            invited_by_origin=_admin_invited_by_origin(registration_invite),
+            invited_by_user_id=(
+                registration_invite.created_by_user_id if registration_invite is not None else None
+            ),
+            invited_by_label=(
+                registration_invite.created_by_label if registration_invite is not None else None
+            ),
+            invited_by_campaign_id=(
+                registration_invite.bulk_campaign_id if registration_invite is not None else None
+            ),
             configuration_id=slot.id,
             configuration_ordinal=slot_ordinals[slot.id],
             configuration_label=slot.label,
@@ -4014,6 +4164,9 @@ def admin_runtime_connections(db: Session = Depends(get_db)):
 def admin_list_users(
     email: str | None = None,
     query: str | None = None,
+    invited_by_origin: Literal["admin", "user", "campaign"] | None = None,
+    invited_by_user_id: UUID | None = None,
+    invited_by_campaign_id: UUID | None = None,
     limit: int = 100,
     offset: int = 0,
     sort_by: Literal[
@@ -4030,18 +4183,7 @@ def admin_list_users(
     bounded_limit = min(max(int(limit), 1), 200)
     bounded_offset = max(int(offset), 0)
 
-    registration_ranked = (
-        select(
-            InviteRedemption.user_id.label("user_id"),
-            InviteRedemption.invite_id.label("invite_id"),
-            InviteRedemption.redeemed_at.label("redeemed_at"),
-            func.row_number().over(
-                partition_by=InviteRedemption.user_id,
-                order_by=(InviteRedemption.redeemed_at.asc(), InviteRedemption.id.asc()),
-            ).label("registration_rank"),
-        )
-        .subquery()
-    )
+    registration_ranked = _admin_registration_ranked_subquery()
     stmt = (
         select(User)
         .outerjoin(
@@ -4062,6 +4204,35 @@ def admin_list_users(
                 func.lower(User.email).contains(search_query, autoescape=True),
                 func.lower(User.display_name).contains(search_query, autoescape=True),
             )
+        )
+
+    if invited_by_user_id is not None and invited_by_campaign_id is not None:
+        raise HTTPException(status_code=422, detail="invited-by user and campaign filters are mutually exclusive")
+    if invited_by_user_id is not None:
+        if invited_by_origin not in (None, "user"):
+            raise HTTPException(status_code=422, detail="invited-by user id requires user origin")
+        invited_by_origin = "user"
+    if invited_by_campaign_id is not None:
+        if invited_by_origin not in (None, "campaign"):
+            raise HTTPException(status_code=422, detail="invited-by campaign id requires campaign origin")
+        invited_by_origin = "campaign"
+
+    if invited_by_origin == "campaign":
+        stmt = stmt.where(Invite.bulk_campaign_id.is_not(None))
+        if invited_by_campaign_id is not None:
+            stmt = stmt.where(Invite.bulk_campaign_id == invited_by_campaign_id)
+    elif invited_by_origin == "user":
+        stmt = stmt.where(
+            Invite.bulk_campaign_id.is_(None),
+            Invite.created_by_kind == "user",
+        )
+        if invited_by_user_id is not None:
+            stmt = stmt.where(Invite.created_by_user_id == invited_by_user_id)
+    elif invited_by_origin == "admin":
+        stmt = stmt.where(
+            Invite.id.is_not(None),
+            Invite.bulk_campaign_id.is_(None),
+            Invite.created_by_kind != "user",
         )
 
     sort_columns = {
@@ -4110,12 +4281,7 @@ def admin_list_users(
                 invite_issued_at=invite.created_at if invite else None,
                 invite_redeemed_at=redemption.redeemed_at if redemption else None,
                 invited_by_kind=invite.created_by_kind if invite else None,
-                invited_by_origin=(
-                    "campaign" if invite and invite.bulk_campaign_id is not None
-                    else "user" if invite and invite.created_by_kind == "user"
-                    else "admin" if invite is not None
-                    else None
-                ),
+                invited_by_origin=_admin_invited_by_origin(invite),
                 invited_by_user_id=invite.created_by_user_id if invite else None,
                 invited_by_label=invite.created_by_label if invite else None,
                 invited_by_campaign_id=invite.bulk_campaign_id if invite else None,
