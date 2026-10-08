@@ -1506,6 +1506,46 @@ def issue_magic_link_for_email(
     return MagicLinkIssueResult(row=row, token=tok.raw)
 
 
+def issue_renewal_reminder_magic_link(
+    db: Session,
+    *,
+    user: User,
+    ttl_seconds: int,
+    request_id: str | None = None,
+) -> MagicLinkIssueResult:
+    if ttl_seconds < 60:
+        raise AuthV2Error("magic-link ttl is too short")
+    if user.email_verified_at is None or user.deletion_requested_at is not None:
+        raise AuthV2Error("renewal reminder user is not eligible")
+
+    now = utcnow()
+    tok = secret_token()
+    row = MagicLinkToken(
+        id=uuid.uuid4(),
+        token_hash=tok.digest,
+        email=normalize_email(user.email),
+        user_id=user.id,
+        invite_id=None,
+        purpose="renewal_login",
+        expires_at=now + timedelta(seconds=ttl_seconds),
+        consumed_at=None,
+        created_at=now,
+    )
+    db.add(row)
+    db.flush()
+    record_audit_event(
+        db,
+        event_type="billing.renewal_reminder.magic_link_issued",
+        actor_kind="system",
+        actor_user_id=user.id,
+        object_type="magic_link_token",
+        object_id=str(row.id),
+        request_id=request_id_or_new(request_id),
+        payload={},
+    )
+    return MagicLinkIssueResult(row=row, token=tok.raw)
+
+
 def _issue_session_for_user(
     db: Session,
     *,
@@ -1598,7 +1638,7 @@ def consume_magic_link(
     agent_wakeup_needed = False
     bulk_campaign_cleanup_id: uuid.UUID | None = None
 
-    if row.purpose == "login":
+    if row.purpose in {"login", "renewal_login"}:
         if row.user_id is None or row.invite_id is not None:
             raise MagicLinkRejected("invalid magic link")
         user = db.get(User, row.user_id)

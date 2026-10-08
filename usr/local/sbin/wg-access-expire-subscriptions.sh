@@ -38,7 +38,7 @@ out="$LOG_DIR/expire-subscriptions.$(date +%Y%m%d).log"
   docker compose exec -T -e WG_ACCESS_EXPIRY_MODE="$EXPIRY_MODE" backend python - <<'PY'
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 import sys
 
@@ -48,18 +48,26 @@ from app.agent_trigger import trigger_wg_access_agent_best_effort
 from app.db.session import SessionLocal
 from app.models import (
     AccessGrant,
+    AuditEvent,
     BillingAccount,
     ConnectionProfile,
     ConnectionSlot,
     Invite,
     ProvisioningJob,
+    User,
 )
 from app.services.domain_v2 import (
     DomainV2Error,
     record_audit_event,
     request_configuration_disable,
 )
-from app.services.billing import apply_due_quantity_transitions, settle_due_prepayment_receipts
+from app.services.billing import (
+    apply_due_quantity_transitions,
+    current_quantity_period_is_paid,
+    settle_due_prepayment_receipts,
+)
+from app.services.auth_v2 import issue_renewal_reminder_magic_link
+from app.services.mail_delivery import deliver_renewal_reminder_email
 
 EXPECTED_PROTOCOLS = {"wireguard", "amneziawg"}
 MODE = os.environ.get("WG_ACCESS_EXPIRY_MODE", "run")
@@ -288,6 +296,91 @@ def _due_quantity_transition_ids(db, *, now):
     ).scalars().all()
 
 
+RENEWAL_REMINDER_WINDOW = timedelta(days=3)
+RENEWAL_REMINDER_TTL_SECONDS = 7 * 24 * 60 * 60
+RENEWAL_REMINDER_EVENT = "billing.renewal_reminder.sent"
+
+
+def _renewal_reminder_marker(account):
+    return f"{account.id}:{account.current_period_end.isoformat()}"
+
+
+def _eligible_renewal_reminder_accounts(db, *, now):
+    return db.execute(
+        select(BillingAccount)
+        .where(BillingAccount.status == "active_paid")
+        .where(BillingAccount.current_period_end > now)
+        .where(BillingAccount.current_period_end <= now + RENEWAL_REMINDER_WINDOW)
+        .order_by(BillingAccount.current_period_end.asc(), BillingAccount.id.asc())
+    ).scalars().all()
+
+
+def _renewal_reminder_already_sent(db, *, account):
+    marker = _renewal_reminder_marker(account)
+    return db.execute(
+        select(AuditEvent.id).where(
+            AuditEvent.event_type == RENEWAL_REMINDER_EVENT,
+            AuditEvent.object_type == "billing_account_period",
+            AuditEvent.object_id == marker,
+        )
+    ).scalar_one_or_none() is not None
+
+
+def _send_due_renewal_reminders(db, *, now):
+    sent = 0
+    skipped_unpaid = 0
+    failures = []
+    accounts = _eligible_renewal_reminder_accounts(db, now=now)
+    for account in accounts:
+        try:
+            if _renewal_reminder_already_sent(db, account=account):
+                db.rollback()
+                continue
+            if not current_quantity_period_is_paid(db, account=account, now=now):
+                db.rollback()
+                skipped_unpaid += 1
+                continue
+            user = db.get(User, account.user_id)
+            if user is None or user.email_verified_at is None or user.deletion_requested_at is not None:
+                raise DomainV2Error(f"renewal reminder user unavailable account={account.id}")
+            issued = issue_renewal_reminder_magic_link(
+                db,
+                user=user,
+                ttl_seconds=RENEWAL_REMINDER_TTL_SECONDS,
+                request_id=f"renewal-reminder:{account.id}:{account.current_period_end.isoformat()}",
+            )
+            if issued.row is None or issued.token is None:
+                raise DomainV2Error(f"renewal reminder magic link unavailable account={account.id}")
+            deliver_renewal_reminder_email(
+                to_email=user.email,
+                token=issued.token,
+                period_end=account.current_period_end,
+            )
+            record_audit_event(
+                db,
+                event_type=RENEWAL_REMINDER_EVENT,
+                actor_kind="system",
+                actor_user_id=user.id,
+                object_type="billing_account_period",
+                object_id=_renewal_reminder_marker(account),
+                payload={
+                    "billing_account_id": str(account.id),
+                    "current_period_end": account.current_period_end.isoformat(),
+                    "magic_link_expires_at": issued.row.expires_at.isoformat(),
+                },
+            )
+            db.commit()
+            sent += 1
+            print(
+                "RENEWAL_REMINDER_SENT="
+                f"account={account.id} period_end={account.current_period_end.isoformat()}"
+            )
+        except Exception as exc:
+            db.rollback()
+            failures.append((str(account.id), type(exc).__name__, str(exc)))
+    return len(accounts), sent, skipped_unpaid, failures
+
+
 def main():
     now = datetime.now(timezone.utc)
     db = SessionLocal()
@@ -295,10 +388,12 @@ def main():
         if MODE == "check":
             finite_grants, finite_slots = _check_finite_grant_integrity(db)
             due_quantity_ids = _due_quantity_transition_ids(db, now=now)
+            renewal_candidates = _eligible_renewal_reminder_accounts(db, now=now)
             db.rollback()
             print(f"FINITE_ACTIVE_GRANTS={finite_grants}")
             print(f"FINITE_ACTIVE_SLOTS_CHECKED={finite_slots}")
             print(f"DUE_QUANTITY_TRANSITIONS={len(due_quantity_ids)}")
+            print(f"RENEWAL_REMINDER_CANDIDATES={len(renewal_candidates)}")
 
         quantity_transitions_applied = 0
         quantity_configurations_created = 0
@@ -324,6 +419,18 @@ def main():
                     f"{item.account_id} quantity={item.quantity_before}->{item.quantity_after} "
                     f"created={item.configurations_created} retirements={item.retirements_requested}"
                 )
+
+        renewal_candidates = 0
+        renewal_reminders_sent = 0
+        renewal_reminders_skipped_unpaid = 0
+        renewal_failures = []
+        if MODE == "run":
+            (
+                renewal_candidates,
+                renewal_reminders_sent,
+                renewal_reminders_skipped_unpaid,
+                renewal_failures,
+            ) = _send_due_renewal_reminders(db, now=now)
 
         due_ids = db.execute(
             select(AccessGrant.id)
@@ -380,10 +487,16 @@ def main():
         print(f"SUPERSEDED_PROVISION_JOBS={superseded_provision_jobs}")
         print(f"COMMERCIAL_ACCOUNTS_EXPIRED={commercial_accounts_expired}")
         print(f"REFERRALS_REVOKED={referrals_revoked}")
+        print(f"RENEWAL_REMINDER_CANDIDATES={renewal_candidates}")
+        print(f"RENEWAL_REMINDERS_SENT={renewal_reminders_sent}")
+        print(f"RENEWAL_REMINDERS_SKIPPED_UNPAID={renewal_reminders_skipped_unpaid}")
+        print(f"RENEWAL_REMINDER_FAILURES={len(renewal_failures)}")
+        for account_id, exc_type, message in renewal_failures:
+            print(f"RENEWAL_REMINDER_FAILURE account={account_id} type={exc_type} detail={message}", file=sys.stderr)
         print(f"EXPIRY_FAILURES={len(failures)}")
         for grant_id, exc_type, message in failures:
             print(f"EXPIRY_FAILURE grant={grant_id} type={exc_type} detail={message}", file=sys.stderr)
-        if failures:
+        if renewal_failures or failures:
             print("RESULT=FAIL_DOMAIN_V2_EXPIRY")
             return 1
         print("RESULT=PASS_DOMAIN_V2_EXPIRY")

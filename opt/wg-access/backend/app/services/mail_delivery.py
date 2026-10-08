@@ -167,3 +167,47 @@ def deliver_support_message(*, reply_to_email: str, user_id: str, message: str) 
         f"{body}\n"
     )
     _send_message(msg)
+
+_RU_MONTHS = (
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+_EN_MONTHS = (
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def deliver_renewal_reminder_email(*, to_email: str, token: str, period_end: datetime) -> None:
+    _host, _port, _security, _username, from_email, from_name, _timeout = _delivery_settings()
+    recipient = str(to_email or "").strip()
+    if not recipient:
+        raise MailDeliveryError("recipient is unavailable")
+    if period_end.tzinfo is None:
+        period_end = period_end.replace(tzinfo=timezone.utc)
+    period_end = period_end.astimezone(timezone.utc)
+    url = _magic_link_url(token)
+    ru_date = f"{period_end.day} {_RU_MONTHS[period_end.month]} {period_end.year} г."
+    en_date = f"{_EN_MONTHS[period_end.month]} {period_end.day}, {period_end.year}"
+
+    msg = EmailMessage()
+    msg["Subject"] = "Secret Studio — напоминание о продлении / Renewal reminder"
+    msg["From"] = f"{from_name} <{from_email}>"
+    msg["To"] = recipient
+    msg.set_content(
+        "Здравствуйте!\n\n"
+        f"Оплаченный период вашего доступа к Secret Studio заканчивается {ru_date}\n\n"
+        "Чтобы продлить доступ, перейдите в личный кабинет по персональной ссылке:\n\n"
+        f"{url}\n\n"
+        "Если вы уже продлили доступ, дополнительных действий не требуется.\n\n"
+        "С уважением,\nSecret Studio\n\n"
+        "----------------------------------------\n\n"
+        "Hello!\n\n"
+        f"Your paid access to Secret Studio expires on {en_date}.\n\n"
+        "To renew your access, open your account using the personal link below:\n\n"
+        f"{url}\n\n"
+        "If you have already renewed your access, no further action is required.\n\n"
+        "Best regards,\nSecret Studio\n"
+    )
+    _send_message(msg)
+
