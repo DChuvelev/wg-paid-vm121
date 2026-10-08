@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     auth_login_rate_limit: int = 5
     auth_redeem_rate_limit: int = 10
     auth_magic_consume_rate_limit: int = 10
+    support_message_rate_window_seconds: int = 10 * 60
+    support_message_rate_limit: int = 5
 
     # Production magic-link delivery. Only authenticated TLS modes are
     # supported; secrets are read from root-only files rather than env values.

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.services.admin_auth import AdminAuthorizationUnavailable, admin_token_matches, load_admin_token
 from app.agent_trigger import trigger_wg_access_agent_best_effort
-from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email
+from app.services.mail_delivery import MailDeliveryError, deliver_magic_link_email, deliver_support_message
 from app.db.session import get_db
 from app.models import (
     AccessGrant,
@@ -2017,6 +2017,88 @@ def account_me_update(
     db.commit()
     db.refresh(user)
     return _account_me_response(db, user=user)
+
+
+class SupportMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+
+
+class SupportMessageResponse(BaseModel):
+    status: Literal["sent"]
+
+
+@router.post("/account/support-message", response_model=SupportMessageResponse)
+def account_support_message(
+    payload: SupportMessageRequest,
+    request: Request,
+    current: tuple[AuthSession, User] = Depends(_current_session),
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_external_onboarding),
+    __: None = Depends(_require_csrf),
+):
+    _, user = current
+    message = str(payload.message).strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message must not be blank")
+    req = _request_id(request)
+    try:
+        enforce_rate_limit(
+            db,
+            scope="support_message",
+            subject=str(user.id),
+            limit=settings.support_message_rate_limit,
+            window_seconds=settings.support_message_rate_window_seconds,
+            request_id=req,
+        )
+        db.commit()
+    except RateLimitExceeded as exc:
+        db.commit()
+        raise HTTPException(status_code=429, detail="too many requests") from exc
+
+    try:
+        deliver_support_message(
+            reply_to_email=user.email,
+            user_id=str(user.id),
+            message=message,
+        )
+    except MailDeliveryError as exc:
+        cause = exc.__cause__
+        cause_type = type(cause).__name__ if cause is not None else type(exc).__name__
+        smtp_code = getattr(cause, "smtp_code", None)
+        os_errno = getattr(cause, "errno", None)
+        if not isinstance(smtp_code, int):
+            smtp_code = None
+        if not isinstance(os_errno, int):
+            os_errno = None
+        logger.error(
+            "support-message delivery failed request_id=%s cause_type=%s smtp_code=%s errno=%s",
+            req, cause_type, smtp_code, os_errno,
+        )
+        record_audit_event(
+            db,
+            event_type="support.message.delivery_failed",
+            actor_kind="user",
+            actor_user_id=user.id,
+            object_type="user",
+            object_id=str(user.id),
+            request_id=req,
+            payload={},
+        )
+        db.commit()
+        raise HTTPException(status_code=503, detail="support message delivery unavailable") from exc
+
+    record_audit_event(
+        db,
+        event_type="support.message.sent",
+        actor_kind="user",
+        actor_user_id=user.id,
+        object_type="user",
+        object_id=str(user.id),
+        request_id=req,
+        payload={},
+    )
+    db.commit()
+    return SupportMessageResponse(status="sent")
 
 
 class BillingPaymentCreateRequest(BaseModel):

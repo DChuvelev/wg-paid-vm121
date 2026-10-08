@@ -109,6 +109,14 @@ def deliver_magic_link_email(*, to_email: str, token: str, issued_at: datetime |
         f"{url}\n"
     )
 
+    _send_message(msg)
+
+
+SUPPORT_EMAIL = "support@secret-studio.ru"
+
+
+def _send_message(msg: EmailMessage) -> None:
+    host, port, security, username, _from_email, _from_name, timeout = _delivery_settings()
     context = ssl.create_default_context()
     if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
         raise MailDeliveryError("TLS verification is unavailable")
@@ -138,3 +146,24 @@ def deliver_magic_link_email(*, to_email: str, token: str, issued_at: datetime |
                 client.send_message(msg)
     except (OSError, smtplib.SMTPException) as exc:
         raise MailDeliveryError("SMTP delivery failed") from exc
+
+
+def deliver_support_message(*, reply_to_email: str, user_id: str, message: str) -> None:
+    _host, _port, _security, _username, from_email, from_name, _timeout = _delivery_settings()
+    reply_to = str(reply_to_email or "").strip()
+    user_ref = str(user_id or "").strip()
+    body = str(message or "").strip()
+    if not reply_to or not user_ref or not body or len(body) > 500:
+        raise MailDeliveryError("support message is invalid")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Secret Studio support — {reply_to}"
+    msg["From"] = f"{from_name} <{from_email}>"
+    msg["To"] = SUPPORT_EMAIL
+    msg["Reply-To"] = reply_to
+    msg.set_content(
+        f"Registered email: {reply_to}\n"
+        f"User ID: {user_ref}\n\n"
+        f"{body}\n"
+    )
+    _send_message(msg)
