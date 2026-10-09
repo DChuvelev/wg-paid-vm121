@@ -1,0 +1,3 @@
+# HMN dedicated account may invoke only the fixed, root-owned restricted bridge.
+Defaults:hmn-ingest env_reset
+hmn-ingest ALL=(root) NOPASSWD: /usr/local/sbin/hmn-ingest-bridge ""
