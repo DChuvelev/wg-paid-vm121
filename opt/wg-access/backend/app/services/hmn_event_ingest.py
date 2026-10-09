@@ -77,7 +77,7 @@ class Batch(BaseModel):
     @model_validator(mode="after")
     def consistency(self) -> "Batch":
         now = datetime.now(timezone.utc)
-        if not now - timedelta(minutes=10) <= self.collected_at_utc <= now + timedelta(minutes=2):
+        if not now - timedelta(days=RETENTION_DAYS) <= self.collected_at_utc <= now + timedelta(minutes=2):
             raise ValueError("collection timestamp out of bounds")
         if self.continuity == "gap_detected" and (self.gap_first_observed_at is None or self.gap_last_observed_at is None):
             raise ValueError("gap timestamps required")
@@ -85,6 +85,7 @@ class Batch(BaseModel):
             raise ValueError("gap timestamp pair must be complete")
         if self.gap_first_observed_at and not self.gap_first_observed_at <= self.gap_last_observed_at <= self.collected_at_utc:
             raise ValueError("gap timestamp ordering invalid")
+        # Coverage freshness is based on collection time, not delayed replay receipt.
         allowed = HEALTH_TYPES if self.source_stream == "health" else RECOVERY_TYPES
         seen = set()
         for ev in self.events:
@@ -154,13 +155,14 @@ def ingest_batch(batch: Batch) -> dict[str, int | str]:
                 inserted += 1
         db.execute(text("UPDATE public.hmn_ingest_batch SET accepted_events=:n WHERE batch_id=:id"), {"n": inserted, "id": batch.batch_id})
         # A late/replayed collection may add events, but must never regress current coverage.
+        # last_success_at records when the source was observed, never when replay arrived.
         latest = db.execute(text("SELECT last_attempt_at FROM public.hmn_stream_coverage WHERE source_stream=:stream FOR UPDATE"), {"stream": batch.source_stream}).scalar_one_or_none()
         if latest is None or batch.collected_at_utc >= latest:
             db.execute(text("""
                 INSERT INTO public.hmn_stream_coverage AS c (
                     source_stream,last_attempt_at,last_success_at,continuity,last_coverage_epoch,
                     last_gap_first_at,last_gap_last_at,gap_count,unknown_lines_total,heartbeat_total,ingested_events_total
-                ) VALUES (:stream,:collected,:now,:continuity,:epoch,:gapfirst,:gaplast,:gaps,:unknown,:heartbeats,:events)
+                ) VALUES (:stream,:collected,:observed_success,:continuity,:epoch,:gapfirst,:gaplast,:gaps,:unknown,:heartbeats,:events)
                 ON CONFLICT (source_stream) DO UPDATE SET
                     last_attempt_at=EXCLUDED.last_attempt_at,
                     last_success_at=EXCLUDED.last_success_at,
@@ -174,14 +176,14 @@ def ingest_batch(batch: Batch) -> dict[str, int | str]:
                     ingested_events_total=c.ingested_events_total + EXCLUDED.ingested_events_total
                 WHERE c.last_attempt_at <= EXCLUDED.last_attempt_at
             """), {"stream": batch.source_stream, "collected": batch.collected_at_utc,
-                   "now": now, "continuity": batch.continuity, "epoch": batch.source_coverage_epoch,
+                   "observed_success": batch.collected_at_utc, "continuity": batch.continuity, "epoch": batch.source_coverage_epoch,
                    "gapfirst": batch.gap_first_observed_at, "gaplast": batch.gap_last_observed_at,
                    "gaps": int(batch.continuity == "gap_detected"), "unknown": batch.unknown_lines,
                    "heartbeats": batch.heartbeat_count, "events": inserted})
         else:
             db.execute(text("UPDATE public.hmn_stream_coverage SET ingested_events_total=ingested_events_total+:n WHERE source_stream=:stream"), {"n": inserted, "stream": batch.source_stream})
         cutoff = now - timedelta(days=RETENTION_DAYS)
-        db.execute(text("DELETE FROM public.hmn_event WHERE ingested_at_utc < :cutoff"), {"cutoff": cutoff})
+        db.execute(text("DELETE FROM public.hmn_event WHERE event_at_utc < :cutoff"), {"cutoff": cutoff})
         db.execute(text("DELETE FROM public.hmn_ingest_batch WHERE ingested_at_utc < :cutoff"), {"cutoff": cutoff})
     return {"status": "accepted", "events_added": inserted}
 
