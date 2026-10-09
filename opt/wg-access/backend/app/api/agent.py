@@ -13,6 +13,7 @@ from app.models import AccessGrant, ConnectionProfile, ConnectionSlot, Peer, Pee
 from app.services.user_deletion import finalize_user_deletion_if_ready
 from app.services.credential_service import CredentialServiceError, decrypt_profile_credential
 from app.services.runtime_snapshot import replace_runtime_snapshot
+from app.services.runtime_activity import observe_runtime_activity
 from app.services.domain_v2 import (
     DomainV2Error,
     acknowledge_profile_job,
@@ -394,6 +395,8 @@ def ingest_runtime_snapshot(
     payload: RuntimeSnapshotRequest,
     _: None = Depends(check_agent_token),
 ):
-    received_at = replace_runtime_snapshot(payload.model_dump(mode="python"))
+    snapshot = payload.model_dump(mode="python")
+    received_at = replace_runtime_snapshot(snapshot)
+    observe_runtime_activity(snapshot, received_at)
     return RuntimeSnapshotAccepted(status="accepted", received_at=received_at, rows=len(payload.rows))
 
