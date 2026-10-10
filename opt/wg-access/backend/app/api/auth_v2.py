@@ -4877,3 +4877,157 @@ def admin_monitoring_events(
         limit=limit, offset=offset, has_more=len(rows) > limit,
         rows=[AdminMonitoringEventRow(**r) for r in rows[:limit]],
     )
+
+
+# B3C2: authenticated, bounded, read-only view of the last accepted VM130 capacity snapshot.
+# This view is not a live health check and does not poll hypervisor or guests.
+import json as _capacity_json
+import os as _capacity_os
+import stat as _capacity_stat
+from pathlib import Path as _CapacityPath
+from pydantic import ConfigDict as _CapacityConfigDict
+
+_CAPACITY_FILE = _CapacityPath('/opt/wg-access/runtime/capacity-ingest/latest.json')
+_CAPACITY_MAX_BYTES = 32768
+_CAPACITY_FRESHNESS_SECONDS = 2700  # 15-minute sampling with bounded tolerance.
+_CapStatus = Literal['available', 'partial', 'unavailable', 'unknown']
+
+
+class AdminCapacityWindow(BaseModel):
+    model_config = _CapacityConfigDict(extra='forbid')
+    status: _CapStatus
+    cpu_avg_pct: float | None
+    cpu_p95_pct: float | None
+    mem_p95_pct: float | None
+    netin_p95_bytes_per_sec: float | None
+    netout_p95_bytes_per_sec: float | None
+    diskread_p95_bytes_per_sec: float | None
+    diskwrite_p95_bytes_per_sec: float | None
+    latest_age_sec: int | None
+    points: int | None
+
+
+class AdminCapacityVm(BaseModel):
+    model_config = _CapacityConfigDict(extra='forbid')
+    status: _CapStatus
+    vcpus: int | None
+    day: AdminCapacityWindow
+    week: AdminCapacityWindow
+
+
+class AdminCapacityGuest(BaseModel):
+    model_config = _CapacityConfigDict(extra='forbid')
+    status: _CapStatus
+    mem_total_mib: int | None
+    mem_available_mib: int | None
+    mem_available_pct: float | None
+    swap_used_mib: int | None
+    psi_cpu_avg300: float | None
+    psi_memory_avg300: float | None
+    psi_io_avg300: float | None
+
+
+class AdminCapacityNode(BaseModel):
+    model_config = _CapacityConfigDict(extra='forbid')
+    status: _CapStatus
+    cpu_count: int | None
+    mem_used_pct: float | None
+    day_cpu_avg_pct: float | None
+    week_cpu_avg_pct: float | None
+
+
+class AdminCapacityNic(BaseModel):
+    model_config = _CapacityConfigDict(extra='forbid')
+    status: _CapStatus
+    link_up: bool | None
+    link_mbps: int | None
+
+
+class AdminCapacitySnapshot(BaseModel):
+    model_config = _CapacityConfigDict(extra='forbid')
+    schema: Literal['wg-capacity-delivery-v1']
+    source: Literal['vm130_resource_monitor']
+    generated_at_utc: datetime
+    source_status: _CapStatus
+    vms: dict[str, AdminCapacityVm]
+    guests: dict[str, AdminCapacityGuest]
+    node: AdminCapacityNode
+    nic: AdminCapacityNic
+
+
+class AdminCapacityResponse(BaseModel):
+    generated_at_utc: datetime
+    status: Literal['available', 'partial', 'stale', 'unavailable']
+    snapshot_at_utc: datetime | None
+    age_seconds: int | None
+    freshness_threshold_seconds: int
+    snapshot: AdminCapacitySnapshot | None
+    current_tunnel_health_verified: Literal[False] = False
+
+
+def _admin_capacity_read(*, now: datetime | None = None, path: _CapacityPath = _CAPACITY_FILE) -> AdminCapacityResponse:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    unavailable = AdminCapacityResponse(
+        generated_at_utc=current, status='unavailable', snapshot_at_utc=None,
+        age_seconds=None, freshness_threshold_seconds=_CAPACITY_FRESHNESS_SECONDS,
+        snapshot=None, current_tunnel_health_verified=False,
+    )
+    fd = None
+    try:
+        fd = _capacity_os.open(path, _capacity_os.O_RDONLY | _capacity_os.O_NOFOLLOW | _capacity_os.O_CLOEXEC)
+        info = _capacity_os.fstat(fd)
+        if not _capacity_stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= _CAPACITY_MAX_BYTES:
+            return unavailable
+        raw = _capacity_os.read(fd, _CAPACITY_MAX_BYTES + 1)
+        if len(raw) != info.st_size:
+            return unavailable
+        snapshot = AdminCapacitySnapshot.model_validate(_capacity_json.loads(raw))
+        if set(snapshot.vms) != {'vm100', 'vm101', 'vm103', 'vm130'}:
+            return unavailable
+        if set(snapshot.guests) != {'vm103', 'vm121', 'vm130'}:
+            return unavailable
+        stamp = snapshot.generated_at_utc
+        if stamp.tzinfo is None:
+            return unavailable
+        stamp = stamp.astimezone(timezone.utc)
+        age = (current - stamp).total_seconds()
+        if age < -300:
+            return unavailable
+        aged = max(0, int(age))
+        if snapshot.source_status == 'unavailable':
+            state = 'unavailable'
+        elif age > _CAPACITY_FRESHNESS_SECONDS:
+            state = 'stale'
+        elif snapshot.source_status != 'available':
+            state = 'partial'
+        elif any(vm.status != 'available' or vm.day.status != 'available' or vm.week.status != 'available' for vm in snapshot.vms.values()):
+            state = 'partial'
+        elif any(guest.status != 'available' for guest in snapshot.guests.values()):
+            state = 'partial'
+        elif snapshot.node.status != 'available' or snapshot.nic.status != 'available':
+            state = 'partial'
+        else:
+            state = 'available'
+        return AdminCapacityResponse(
+            generated_at_utc=current, status=state, snapshot_at_utc=stamp,
+            age_seconds=aged, freshness_threshold_seconds=_CAPACITY_FRESHNESS_SECONDS,
+            snapshot=snapshot, current_tunnel_health_verified=False,
+        )
+    except (OSError, ValueError, TypeError):
+        return unavailable
+    finally:
+        if fd is not None:
+            _capacity_os.close(fd)
+
+
+@router.get(
+    '/admin/monitoring/capacity',
+    response_model=AdminCapacityResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_monitoring_capacity() -> AdminCapacityResponse:
+    return _admin_capacity_read()
