@@ -21,3 +21,7 @@ services:
         source: /root/.config/secret-studio/yookassa-live.env
         target: /opt/wg-access/runtime/secrets/yookassa-live.env
         read_only: true
+      - type: bind
+        source: /var/lib/wg-capacity-ingest
+        target: /opt/wg-access/runtime/capacity-ingest
+        read_only: true
