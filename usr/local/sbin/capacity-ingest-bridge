@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Restricted capacity ingest endpoint. No HTTP, Docker privileges or shell commands."""
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+MAX_BYTES = 32768
+DEST = Path('/var/lib/wg-capacity-ingest/latest.json')
+LOCK = Path('/var/lib/wg-capacity-ingest/.lock')
+VM_IDS = ('vm100', 'vm101', 'vm103', 'vm130')
+GUEST_IDS = ('vm103', 'vm121', 'vm130')
+STATUSES = ('available', 'partial', 'unavailable', 'unknown')
+METRICS = {
+    'cpu_avg_pct': 100, 'cpu_p95_pct': 100, 'mem_p95_pct': 100,
+    'netin_p95_bytes_per_sec': 1e12, 'netout_p95_bytes_per_sec': 1e12,
+    'diskread_p95_bytes_per_sec': 1e12, 'diskwrite_p95_bytes_per_sec': 1e12,
+    'latest_age_sec': 86400 * 8, 'points': 100000,
+}
+GUEST_METRICS = {
+    'mem_total_mib': 1e8, 'mem_available_mib': 1e8,
+    'mem_available_pct': 100, 'swap_used_mib': 1e8,
+    'psi_cpu_avg300': 100, 'psi_memory_avg300': 100,
+    'psi_io_avg300': 100,
+}
+
+def bounded_number(v, limit, integer=False):
+    if v is None: return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError('not number')
+    if v < 0 or v > limit or (integer and not isinstance(v, int)):
+        raise ValueError('out of range')
+    return v
+
+def exact(obj, keys):
+    if not isinstance(obj, dict) or set(obj) != set(keys):
+        raise ValueError('keys invalid')
+
+def normalize(raw, now=None):
+    if not raw or len(raw) > MAX_BYTES: raise ValueError('size invalid')
+    try: obj = json.loads(raw)
+    except (UnicodeDecodeError, ValueError): raise ValueError('json invalid') from None
+    exact(obj, ('schema', 'source', 'generated_at_utc', 'source_status',
+                'vms', 'guests', 'node', 'nic'))
+    if obj['schema'] != 'wg-capacity-delivery-v1' or obj['source'] != 'vm130_resource_monitor':
+        raise ValueError('schema invalid')
+    if obj['source_status'] not in STATUSES: raise ValueError('status invalid')
+    stamp = obj['generated_at_utc']
+    if not isinstance(stamp, str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', stamp):
+        raise ValueError('timestamp invalid')
+    try: ts=dt.datetime.strptime(stamp,'%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=dt.timezone.utc)
+    except ValueError: raise ValueError('timestamp invalid') from None
+    now=now or dt.datetime.now(dt.timezone.utc)
+    age=(now-ts).total_seconds()
+    if age < -300 or age > 7*86400: raise ValueError('timestamp age')
+    exact(obj['vms'], VM_IDS)
+    for item in obj['vms'].values():
+        exact(item, ('status', 'vcpus', 'day', 'week'))
+        if item['status'] not in STATUSES: raise ValueError('vm status')
+        bounded_number(item['vcpus'], 128, integer=True)
+        for period in ('day','week'):
+            window=item[period]
+            exact(window, ('status', *METRICS))
+            if window['status'] not in STATUSES: raise ValueError('window status')
+            for name,limit in METRICS.items():
+                bounded_number(window[name], limit, integer=name in ('points','latest_age_sec'))
+    exact(obj['guests'], GUEST_IDS)
+    for guest in obj['guests'].values():
+        exact(guest, ('status', *GUEST_METRICS))
+        if guest['status'] not in STATUSES: raise ValueError('guest status')
+        for name,limit in GUEST_METRICS.items():
+            bounded_number(guest[name],limit,integer=name in ('mem_total_mib','mem_available_mib','swap_used_mib'))
+    exact(obj['node'], ('status','cpu_count','mem_used_pct','day_cpu_avg_pct','week_cpu_avg_pct'))
+    if obj['node']['status'] not in STATUSES: raise ValueError('node status')
+    bounded_number(obj['node']['cpu_count'],256,integer=True)
+    for key in ('mem_used_pct','day_cpu_avg_pct','week_cpu_avg_pct'):
+        bounded_number(obj['node'][key],100)
+    exact(obj['nic'], ('status','link_up','link_mbps'))
+    if obj['nic']['status'] not in STATUSES: raise ValueError('nic status')
+    if obj['nic']['link_up'] is not None and type(obj['nic']['link_up']) is not bool:
+        raise ValueError('nic link')
+    bounded_number(obj['nic']['link_mbps'],1e6,integer=True)
+    # Only the explicit, validated telemetry fields survive. No raw strings or paths.
+    return obj
+
+def store(raw, dest=DEST, lock=LOCK, now=None):
+    obj=normalize(raw,now=now)
+    canonical=(json.dumps(obj,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+    digest=hashlib.sha256(canonical).hexdigest()
+    dest.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(dest.parent,0o700)
+    lock_fd=os.open(lock,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(lock_fd,fcntl.LOCK_EX)
+        if dest.is_symlink():raise ValueError('symlink')
+        if dest.exists():
+            if not dest.is_file() or dest.stat().st_size>MAX_BYTES: raise ValueError('existing invalid')
+            old=normalize(dest.read_bytes(),now=now)
+            old_stamp=old['generated_at_utc']
+            new_stamp=obj['generated_at_utc']
+            if old_stamp > new_stamp: return 'stale',digest
+            if old_stamp == new_stamp:
+                old_bytes=(json.dumps(old,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+                if hashlib.sha256(old_bytes).hexdigest()!=digest: raise ValueError('timestamp conflict')
+                return 'duplicate',digest
+        fd,tmp=tempfile.mkstemp(prefix='.capacity-',dir=dest.parent)
+        try:
+            with os.fdopen(fd,'wb') as f:
+                f.write(canonical); f.flush(); os.fsync(f.fileno())
+            os.chmod(tmp,0o600)
+            os.replace(tmp,dest)
+            dirfd=os.open(dest.parent,os.O_DIRECTORY|os.O_RDONLY)
+            try: os.fsync(dirfd)
+            finally: os.close(dirfd)
+        finally:
+            if os.path.lexists(tmp):os.unlink(tmp)
+        return 'accepted',digest
+    finally:
+        os.close(lock_fd)
+
+def main():
+    raw=sys.stdin.buffer.read(MAX_BYTES+1)
+    try:
+        status,digest=store(raw)
+    except (ValueError,TypeError,OSError,UnicodeError):
+        print('CAPACITY_INGEST_REJECTED',file=sys.stderr)
+        return 2
+    # ACK has no input data or private identifiers.
+    print(json.dumps({'status':status,'sha256':digest},separators=(',',':')))
+    return 0
+
+if __name__=='__main__':raise SystemExit(main())

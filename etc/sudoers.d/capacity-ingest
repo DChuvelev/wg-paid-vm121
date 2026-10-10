@@ -1,0 +1,3 @@
+# Dedicated capacity ingestion: fixed root-owned command, zero arguments.
+Defaults:capacity-ingest env_reset
+capacity-ingest ALL=(root) NOPASSWD: /usr/local/sbin/capacity-ingest-bridge ""
