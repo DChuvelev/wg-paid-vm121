@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import base64
 import hashlib
@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -4650,4 +4650,230 @@ def admin_set_protocol_limit(
         retire_profile_ids=selected_ids,
         disable_jobs_created=disable_jobs_created,
         retirement_in_progress=bool(selected_slot_ids),
+    )
+
+
+# B2: bounded, private, read-only observations (never assert tunnel up/down from history).
+class AdminMonitoringActivitySummary(BaseModel):
+    expected_minutes: int
+    observed_minutes: int
+    complete_minutes: int
+    partial_minutes: int
+    unknown_minutes: int
+    missing_minutes: int
+    coverage_ratio_over_window: float
+    last_observed_minute_utc: datetime | None
+    last_received_at_utc: datetime | None
+    last_received_age_seconds: float | None
+    stale: bool
+    peak_active_configurations_observed: int | None
+    peak_active_users_observed: int | None
+    last_active_configurations_observed: int | None
+    last_active_users_observed: int | None
+    last_selector_peaks_observed: dict[str, int | None]
+    unmatched_rows_total: int
+    conflicted_slots_total: int
+
+
+class AdminMonitoringStreamSummary(BaseModel):
+    source_stream: Literal["health", "recovery"]
+    last_attempt_at_utc: datetime | None
+    last_success_at_utc: datetime | None
+    success_age_seconds: float | None
+    stale: bool
+    continuity: Literal["continuous", "gap_detected", "initial_unknown", "stale", "error"] | None
+    gap_count: int
+    unknown_lines_total: int
+    heartbeat_total: int
+    ingested_events_total: int
+    last_gap_first_at_utc: datetime | None
+    last_gap_last_at_utc: datetime | None
+
+
+class AdminMonitoringEventCount(BaseModel):
+    source_stream: Literal["health", "recovery"]
+    egress_slot: int | None
+    event_type: str
+    provenance: Literal["forward_live", "historical_retained_only"]
+    count: int
+
+
+class AdminMonitoringSummaryResponse(BaseModel):
+    generated_at_utc: datetime
+    window_start_utc: datetime
+    window_end_utc: datetime
+    window_hours: int
+    freshness_threshold_seconds: int
+    activity: AdminMonitoringActivitySummary
+    stream_coverage: list[AdminMonitoringStreamSummary]
+    event_observations: list[AdminMonitoringEventCount]
+    current_tunnel_health_verified: Literal[False] = False
+
+
+class AdminMonitoringEventRow(BaseModel):
+    event_at_utc: datetime
+    observed_at_utc: datetime
+    source_stream: Literal["health", "recovery"]
+    egress_slot: int | None
+    event_type: str
+    result: Literal["pass", "failed", "other", "na"]
+    provenance: Literal["forward_live", "historical_retained_only"]
+
+
+class AdminMonitoringEventsResponse(BaseModel):
+    generated_at_utc: datetime
+    window_start_utc: datetime
+    window_end_utc: datetime
+    limit: int
+    offset: int
+    has_more: bool
+    rows: list[AdminMonitoringEventRow]
+
+
+_MONITORING_SELECTORS = ("egress1", "egress2", "egress3", "egress4", "egress5")
+_MONITORING_FRESHNESS_SECONDS = 180
+
+
+def _monitoring_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _monitoring_age(now: datetime, value: datetime | None) -> float | None:
+    normalized = _monitoring_utc(value)
+    return None if normalized is None else round(max(0.0, (now - normalized).total_seconds()), 2)
+
+
+def _monitoring_bounds(now: datetime, hours: int) -> tuple[datetime, datetime]:
+    # Only fully closed minutes. The active minute is not a completed observation.
+    end = now.replace(second=0, microsecond=0)
+    return end - timedelta(hours=hours), end
+
+
+@router.get(
+    "/admin/monitoring/summary",
+    response_model=AdminMonitoringSummaryResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_monitoring_summary(
+    window_hours: int = Query(default=24, ge=1, le=168),
+    db: Session = Depends(get_db),
+) -> AdminMonitoringSummaryResponse:
+    now = utcnow()
+    start, end = _monitoring_bounds(now, window_hours)
+    minute_rows = db.execute(text("""
+        SELECT minute_utc, coverage_status, coverage_ratio,
+               active_configurations_peak, active_users_peak, selector_peak,
+               last_received_at, unmatched_rows_total, conflicted_slots_total
+        FROM public.runtime_activity_minute
+        WHERE minute_utc >= :start AND minute_utc < :end
+        ORDER BY minute_utc ASC
+        LIMIT 10080
+    """), {"start": start, "end": end}).mappings().all()
+    expected = window_hours * 60
+    observed = len(minute_rows)
+    last = minute_rows[-1] if minute_rows else None
+    received = _monitoring_utc(last["last_received_at"]) if last else None
+    age = _monitoring_age(now, received)
+    valid = [r for r in minute_rows if r["coverage_status"] != "unknown"]
+    last_sel = (last["selector_peak"] or {}) if last else {}
+    # JSONB is already a dict in PostgreSQL, and contains logical slots, not WG/AWG siblings.
+    selector_observed = {s: (int(last_sel[s]) if s in last_sel and last_sel[s] is not None else None)
+                         for s in _MONITORING_SELECTORS}
+    activity = AdminMonitoringActivitySummary(
+        expected_minutes=expected, observed_minutes=observed,
+        complete_minutes=sum(r["coverage_status"] == "complete" for r in minute_rows),
+        partial_minutes=sum(r["coverage_status"] == "partial" for r in minute_rows),
+        unknown_minutes=sum(r["coverage_status"] == "unknown" for r in minute_rows),
+        missing_minutes=max(0, expected-observed),
+        coverage_ratio_over_window=round(min(1.0, sum(float(r["coverage_ratio"]) for r in minute_rows)/expected), 6),
+        last_observed_minute_utc=_monitoring_utc(last["minute_utc"]) if last else None,
+        last_received_at_utc=received, last_received_age_seconds=age,
+        stale=age is None or age > _MONITORING_FRESHNESS_SECONDS,
+        peak_active_configurations_observed=max((int(r["active_configurations_peak"]) for r in valid
+                                                 if r["active_configurations_peak"] is not None), default=None),
+        peak_active_users_observed=max((int(r["active_users_peak"]) for r in valid
+                                        if r["active_users_peak"] is not None), default=None),
+        last_active_configurations_observed=(int(last["active_configurations_peak"])
+                                            if last and last["active_configurations_peak"] is not None and last["coverage_status"] != "unknown" else None),
+        last_active_users_observed=(int(last["active_users_peak"])
+                                    if last and last["active_users_peak"] is not None and last["coverage_status"] != "unknown" else None),
+        last_selector_peaks_observed=selector_observed if last and last["coverage_status"] != "unknown"
+                                     else {s: None for s in _MONITORING_SELECTORS},
+        unmatched_rows_total=sum(int(r["unmatched_rows_total"]) for r in minute_rows),
+        conflicted_slots_total=sum(int(r["conflicted_slots_total"]) for r in minute_rows),
+    )
+    stream_rows = db.execute(text("""
+        SELECT source_stream, last_attempt_at, last_success_at, continuity,
+               last_gap_first_at, last_gap_last_at, gap_count,
+               unknown_lines_total, heartbeat_total, ingested_events_total
+        FROM public.hmn_stream_coverage
+        WHERE source_stream IN ('health', 'recovery')
+        ORDER BY source_stream ASC
+    """)).mappings().all()
+    by_stream = {r["source_stream"]: r for r in stream_rows}
+    streams = []
+    for stream in ("health", "recovery"):
+        r = by_stream.get(stream)
+        success_age = _monitoring_age(now, r["last_success_at"] if r else None)
+        streams.append(AdminMonitoringStreamSummary(
+            source_stream=stream,
+            last_attempt_at_utc=_monitoring_utc(r["last_attempt_at"]) if r else None,
+            last_success_at_utc=_monitoring_utc(r["last_success_at"]) if r else None,
+            success_age_seconds=success_age,
+            stale=success_age is None or success_age > _MONITORING_FRESHNESS_SECONDS,
+            continuity=r["continuity"] if r else None,
+            gap_count=int(r["gap_count"]) if r else 0,
+            unknown_lines_total=int(r["unknown_lines_total"]) if r else 0,
+            heartbeat_total=int(r["heartbeat_total"]) if r else 0,
+            ingested_events_total=int(r["ingested_events_total"]) if r else 0,
+            last_gap_first_at_utc=_monitoring_utc(r["last_gap_first_at"]) if r else None,
+            last_gap_last_at_utc=_monitoring_utc(r["last_gap_last_at"]) if r else None,
+        ))
+    counts = db.execute(text("""
+        SELECT source_stream, egress_slot, event_type, provenance, COUNT(*) AS event_count
+        FROM public.hmn_event
+        WHERE event_at_utc >= :start AND event_at_utc < :end
+        GROUP BY source_stream, egress_slot, event_type, provenance
+        ORDER BY source_stream, egress_slot, event_type, provenance
+        LIMIT 500
+    """), {"start": start, "end": end}).mappings().all()
+    return AdminMonitoringSummaryResponse(
+        generated_at_utc=now, window_start_utc=start, window_end_utc=end,
+        window_hours=window_hours, freshness_threshold_seconds=_MONITORING_FRESHNESS_SECONDS,
+        activity=activity, stream_coverage=streams,
+        event_observations=[AdminMonitoringEventCount(
+            source_stream=r["source_stream"], egress_slot=r["egress_slot"],
+            event_type=r["event_type"], provenance=r["provenance"], count=int(r["event_count"]))
+            for r in counts],
+        current_tunnel_health_verified=False,
+    )
+
+
+@router.get(
+    "/admin/monitoring/events",
+    response_model=AdminMonitoringEventsResponse,
+    dependencies=[Depends(_require_admin)],
+)
+def admin_monitoring_events(
+    window_hours: int = Query(default=24, ge=1, le=168),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=5000),
+    db: Session = Depends(get_db),
+) -> AdminMonitoringEventsResponse:
+    now = utcnow()
+    start, end = _monitoring_bounds(now, window_hours)
+    rows = db.execute(text("""
+        SELECT event_at_utc, observed_at_utc, source_stream, egress_slot,
+               event_type, result, provenance
+        FROM public.hmn_event
+        WHERE event_at_utc >= :start AND event_at_utc < :end
+        ORDER BY event_at_utc DESC, event_id DESC
+        LIMIT :limit OFFSET :offset
+    """), {"start": start, "end": end, "limit": limit+1, "offset": offset}).mappings().all()
+    return AdminMonitoringEventsResponse(
+        generated_at_utc=now, window_start_utc=start, window_end_utc=end,
+        limit=limit, offset=offset, has_more=len(rows) > limit,
+        rows=[AdminMonitoringEventRow(**r) for r in rows[:limit]],
     )
