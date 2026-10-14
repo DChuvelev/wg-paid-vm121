@@ -303,6 +303,149 @@ def remote_registry():
     return parse_registry(remote_command(command, log_output=False))
 
 
+# R01: passive paid-interface reconstruction oracle. The two CLI commands and
+# registry are read in a single bounded SSH invocation; no lifecycle --status,
+# state-changing helper or persistent remote observer is introduced.
+PAID_RUNTIME_INTERFACES = {"wireguard": ("wg", "wg_paid"),
+                           "amneziawg": ("awg", "awg_paid")}
+SNAPSHOT_START = "WGPAID_RUNTIME_V1"
+SNAPSHOT_END = "WGPAID_RUNTIME_END"
+MAX_SNAPSHOT_BYTES = 1024 * 1024
+
+
+def parse_runtime_allowed_ips(text, protocol):
+    parsed = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            raise RuntimeError(f"VM100 {protocol} runtime malformed empty line")
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            raise RuntimeError(f"VM100 {protocol} runtime malformed row")
+        key, value = parts
+        require_wg_key("runtime public_key", key)
+        if key in parsed:
+            raise RuntimeError(f"VM100 {protocol} runtime duplicate public key")
+        if value == "(none)":
+            parsed[key] = frozenset()
+            continue
+        entries = [s.strip() for s in value.split(",")]
+        if not entries or any(not s for s in entries):
+            raise RuntimeError(f"VM100 {protocol} runtime malformed allowed-ips")
+        try:
+            nets = [ipaddress.ip_network(s, strict=True) for s in entries]
+        except ValueError:
+            raise RuntimeError(
+                f"VM100 {protocol} runtime invalid allowed-ips"
+            ) from None
+        if len(nets) != len(set(nets)):
+            raise RuntimeError(f"VM100 {protocol} runtime duplicate allowed-ips")
+        parsed[key] = frozenset(str(net) for net in nets)
+    return parsed
+
+
+def parse_runtime_snapshot(text):
+    if len(text.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+        raise RuntimeError("VM100 runtime snapshot too large")
+    lines = text.splitlines()
+    if not lines or lines[0] != SNAPSHOT_START or lines[-1] != SNAPSHOT_END:
+        raise RuntimeError("VM100 runtime snapshot invalid framing")
+    markers = ("REGISTRY_BEGIN", "REGISTRY_END", "WG_BEGIN", "WG_END",
+               "AWG_BEGIN", "AWG_END")
+    positions = []
+    for marker in markers:
+        indexes = [i for i, s in enumerate(lines) if s == marker]
+        if len(indexes) != 1:
+            raise RuntimeError("VM100 runtime snapshot missing/duplicate section")
+        positions.append(indexes[0])
+    rb, re_, wb, we, ab, ae = positions
+    if not (rb == 2 and rb < re_ < wb < we < ab < ae == len(lines)-3):
+        raise RuntimeError("VM100 runtime snapshot section ordering invalid")
+    if not lines[1].startswith("BOOT_BEGIN\t") or not lines[-2].startswith("BOOT_END\t"):
+        raise RuntimeError("VM100 runtime snapshot missing boot identity")
+    boot_begin = lines[1].split("\t", 1)[1]
+    boot_end = lines[-2].split("\t", 1)[1]
+    if (not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_begin)
+            or boot_begin != boot_end):
+        raise RuntimeError("VM100 runtime snapshot boot changed/invalid")
+    registry_text = "\n".join(lines[rb+1:re_])
+    if ("# schema=router-wgpay-peer-registry-v1" not in registry_text.splitlines()
+            or "# columns=profile_id protocol interface public_key tunnel_ip normal_selector active_selector desired_generation created_epoch updated_epoch" not in registry_text.splitlines()):
+        raise RuntimeError("VM100 runtime registry missing canonical header")
+    reg = parse_registry(registry_text)
+    if lines[wb] != "WG_BEGIN" or lines[ab] != "AWG_BEGIN":
+        raise RuntimeError("VM100 runtime snapshot invalid interface framing")
+    actual = {
+        "wireguard": parse_runtime_allowed_ips("\n".join(lines[wb+1:we]), "wireguard"),
+        "amneziawg": parse_runtime_allowed_ips("\n".join(lines[ab+1:ae]), "amneziawg"),
+    }
+    seen_ids, seen_keys, seen_ips = set(), set(), set()
+    for row in reg:
+        if row["protocol"] not in PAID_RUNTIME_INTERFACES:
+            raise RuntimeError("VM100 runtime snapshot unexpected registry protocol")
+        if row["interface"] != PAID_RUNTIME_INTERFACES[row["protocol"]][1]:
+            raise RuntimeError("VM100 runtime snapshot registry interface mismatch")
+        identity = (row["protocol"], row["public_key"])
+        if (row["profile_id"] in seen_ids or identity in seen_keys
+                or row["tunnel_ip"] in seen_ips):
+            raise RuntimeError("VM100 runtime snapshot duplicate registry identity")
+        seen_ids.add(row["profile_id"])
+        seen_keys.add(identity)
+        seen_ips.add(row["tunnel_ip"])
+    return {"boot_id": boot_begin, "registry": reg, "actual": actual}
+
+
+def remote_runtime_snapshot():
+    # Substitution keeps stdout private until all three commands and the final
+    # boot-id check succeed. Each nonzero RC is an UNKNOWN, never an empty list.
+    # Never propagate SSH stderr/stdout: remote_command exceptions can embed
+    # command output, which this reader must not disclose in logs or tracebacks.
+    script = r'''set -eu
+stop_read() { printf 'R01_READ_STOP_%s\n' "$1" >&2; exit 74; }
+boot_begin="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || stop_read boot_begin
+registry="$(cat ''' + shlex.quote(REMOTE_REGISTRY_FILE) + r''' 2>/dev/null)" || stop_read registry
+wg_rows="$(wg show wg_paid allowed-ips 2>/dev/null)" || stop_read wg
+awg_rows="$(awg show awg_paid allowed-ips 2>/dev/null)" || stop_read awg
+boot_end="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || stop_read boot_end
+[ "$boot_begin" = "$boot_end" ] || stop_read boot_changed
+[ "${#registry}" -le 600000 ] || stop_read registry_size
+[ "${#wg_rows}" -le 200000 ] || stop_read wg_size
+[ "${#awg_rows}" -le 200000 ] || stop_read awg_size
+printf 'WGPAID_RUNTIME_V1\nBOOT_BEGIN\t%s\nREGISTRY_BEGIN\n%s\nREGISTRY_END\nWG_BEGIN\n%s\nWG_END\nAWG_BEGIN\n%s\nAWG_END\nBOOT_END\t%s\nWGPAID_RUNTIME_END\n' \
+    "$boot_begin" "$registry" "$wg_rows" "$awg_rows" "$boot_end"
+'''
+    try:
+        raw = remote_command(script, log_output=False)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        raise RuntimeError("VM100 paid runtime snapshot unavailable (UNKNOWN)") from None
+    return parse_runtime_snapshot(raw)
+
+
+def assert_no_unregistered_runtime(snapshot):
+    known = {(r["protocol"], r["public_key"]) for r in snapshot["registry"]}
+    for protocol in MANAGED_PROTOCOLS:
+        extra = set(snapshot["actual"][protocol]) - {
+            key for p, key in known if p == protocol
+        }
+        if extra:
+            raise RuntimeError(
+                f"VM100 unregistered {protocol} kernel peers: count={len(extra)}"
+            )
+
+
+def peer_runtime_matches(peer, snapshot):
+    actual = snapshot["actual"][peer["protocol"]].get(peer["public_key"])
+    return actual == frozenset((peer["allowed_ips"],))
+
+
+def registry_runtime_aligned(snapshot):
+    assert_no_unregistered_runtime(snapshot)
+    for row in snapshot["registry"]:
+        if snapshot["actual"][row["protocol"]].get(row["public_key"]) != frozenset((row["tunnel_ip"] + "/32",)):
+            return False
+    return True
+
+
 def find_registry_profile(peer, rows):
     key_rows = [row for row in rows if row["public_key"] == peer["public_key"]]
     ip_rows = [row for row in rows if row["tunnel_ip"] == peer["tunnel_ip"]]
@@ -455,21 +598,40 @@ def fetch_enabled_peers():
     return desired
 
 
-def sync_enabled_peers():
+def sync_enabled_peers(*, runtime_before=None):
     desired = fetch_enabled_peers()
     log(f"sync desired enabled peers total: {len(desired)}")
-
-    registry_before = remote_registry()
+    snapshot = runtime_before if runtime_before is not None else remote_runtime_snapshot()
+    assert_no_unregistered_runtime(snapshot)
+    registry_before = snapshot["registry"]
     log(f"sync VM100 lifecycle registry peers before: {len(registry_before)}")
-    changed = False
 
+    # Fail closed on conflicts for *all* desired peers before first mutation.
+    # Reuse the lifecycle registry matcher so legacy profile IDs remain valid.
+    seen_ips, seen_ids = set(), set()
+    matches = {}
     for public_key in sorted(desired):
         peer = desired[public_key]
+        if peer["tunnel_ip"] in seen_ips:
+            raise RuntimeError("duplicate desired tunnel_ip")
+        seen_ips.add(peer["tunnel_ip"])
         existing = find_registry_profile(peer, registry_before)
+        if existing is not None:
+            if existing["profile_id"] in seen_ids:
+                raise RuntimeError("duplicate desired registry profile")
+            seen_ids.add(existing["profile_id"])
+        matches[public_key] = existing
+
+    changed = False
+    for public_key in sorted(desired):
+        peer = desired[public_key]
+        existing = matches[public_key]
         if (
             existing is not None
             and existing["protocol"] == peer["protocol"]
+            and existing["interface"] == PAID_RUNTIME_INTERFACES[peer["protocol"]][1]
             and existing["desired_generation"] == desired_generation(peer)
+            and peer_runtime_matches(peer, snapshot)
         ):
             continue
         profile_id, mode = lifecycle_enable_or_ensure(
@@ -501,21 +663,28 @@ def sync_enabled_peers():
             f"tunnel_ip={row['tunnel_ip']}"
         )
 
-    registry_after = remote_registry() if changed else registry_before
-    actual = {
+    after = remote_runtime_snapshot() if changed else snapshot
+    if after["boot_id"] != snapshot["boot_id"]:
+        raise RuntimeError("VM100 boot changed during peer reconcile")
+    assert_no_unregistered_runtime(after)
+    registry_after = after["registry"]
+    actual_registry = {
         (row["protocol"], row["public_key"], row["tunnel_ip"])
         for row in registry_after
-        if row["protocol"] in MANAGED_PROTOCOLS
     }
-    expected = {
+    expected_registry = {
         (peer["protocol"], peer["public_key"], peer["tunnel_ip"])
         for peer in desired.values()
     }
-    if actual != expected:
+    if actual_registry != expected_registry:
         raise RuntimeError(
-            f"VM100 lifecycle registry mismatch after reconcile "
-            f"expected={len(expected)} actual={len(actual)}"
+            "VM100 lifecycle registry mismatch after reconcile "
+            f"expected={len(expected_registry)} actual={len(actual_registry)}"
         )
+    if not all(peer_runtime_matches(peer, after) for peer in desired.values()):
+        raise RuntimeError("VM100 paid kernel peer mismatch after reconcile")
+    if not registry_runtime_aligned(after):
+        raise RuntimeError("VM100 paid registry/kernel mismatch after reconcile")
 
     state = load_state()
     state["peers"] = {}
@@ -537,7 +706,6 @@ def sync_enabled_peers():
         f"changed={1 if changed else 0}"
     )
     return desired, registry_after
-
 
 
 def parse_iso8601_epoch(value):
@@ -1055,10 +1223,17 @@ def run_once():
     pending = fetch_pending_jobs()
     if pending:
         process_pending_jobs(pending)
+        # Jobs do not prove unrelated registered clients survived a VM100 boot.
+        # One passive batch audit avoids starvation under a continuous job queue.
+        runtime_snapshot = remote_runtime_snapshot()
+        if registry_runtime_aligned(runtime_snapshot):
+            log("post-jobs paid kernel audit aligned; no full desired fetch")
+        else:
+            log("post-jobs paid kernel drift; running fallback reconcile")
+            sync_enabled_peers(runtime_before=runtime_snapshot)
     else:
         # No due job exists: retain the existing desired-state reconcile as the
-        # periodic/fallback convergence mechanism. Unchanged peers are verified
-        # from one registry snapshot and do not receive redundant lifecycle --ensure.
+        # periodic/fallback convergence mechanism.
         log("no pending jobs; running fallback reconcile")
         sync_enabled_peers()
 
