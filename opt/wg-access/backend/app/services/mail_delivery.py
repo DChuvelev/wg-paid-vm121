@@ -168,6 +168,23 @@ def deliver_support_message(*, reply_to_email: str, user_id: str, message: str) 
     )
     _send_message(msg)
 
+
+def deliver_admin_broadcast_email(*, to_email: str, subject: str, body: str, test: bool = False) -> None:
+    """Only transport; persistent idempotency belongs to broadcast service/worker."""
+    _host, _port, _security, _username, from_email, from_name, _timeout = _delivery_settings()
+    # Header sanitization takes place in the Admin request/service validation too.
+    recipient = str(to_email or "").strip()
+    title = str(subject or "")
+    if not recipient or not title or any(ord(c) < 32 or ord(c) == 127 for c in title):
+        raise MailDeliveryError("broadcast envelope is invalid")
+    msg = EmailMessage()
+    msg["Subject"] = ("[TEST] " if test else "") + title
+    msg["From"] = f"{from_name} <{from_email}>"
+    msg["To"] = recipient
+    msg["Reply-To"] = SUPPORT_EMAIL
+    msg.set_content(str(body))
+    _send_message(msg)
+
 _RU_MONTHS = (
     "", "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря",

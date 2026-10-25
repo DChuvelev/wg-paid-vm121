@@ -493,3 +493,42 @@ class ProvisioningJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AdminBroadcast(Base):
+    __tablename__ = "admin_broadcasts"
+    __table_args__ = (
+        CheckConstraint("audience IN ('active','all')", name="admin_broadcast_audience_allowed"),
+        CheckConstraint("state IN ('draft','queued','sending','paused','completed','completed_with_uncertain')", name="admin_broadcast_state_allowed"),
+        CheckConstraint("recipient_count >= 0", name="admin_broadcast_count_nonnegative"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    audience: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    recipient_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    test_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AdminBroadcastRecipient(Base):
+    __tablename__ = "admin_broadcast_recipients"
+    __table_args__ = (
+        UniqueConstraint("broadcast_id", "normalized_email", name="uq_admin_broadcast_recipient_email"),
+        CheckConstraint("state IN ('pending','in_flight','smtp_accepted','uncertain','skipped')", name="admin_broadcast_recipient_state_allowed"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    broadcast_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("admin_broadcasts.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Legacy users.id is an accepted soft UUID reference, not a new FK target.
+    # Verify eligibility against User before sending (admin_broadcast service).
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    normalized_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_category: Mapped[str | None] = mapped_column(String(40))

@@ -1,5 +1,7 @@
 from app.models.core import (
     User,
+    AdminBroadcast,
+    AdminBroadcastRecipient,
     Plan,
     AccessGrant,
     AccessGrantProtocolLimit,
@@ -25,6 +27,8 @@ from app.models.core import (
 
 __all__ = [
     "User",
+    "AdminBroadcast",
+    "AdminBroadcastRecipient",
     "Plan",
     "AccessGrant",
     "AccessGrantProtocolLimit",
