@@ -1,0 +1,15 @@
+[Unit]
+Description=WG Access private Admin broadcast queue dispatcher
+Requires=docker.service
+After=network-online.target docker.service
+ConditionPathExists=/usr/local/sbin/wg-access-broadcast-dispatch.sh
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/wg-access
+ExecStart=/usr/local/sbin/wg-access-broadcast-dispatch.sh
+TimeoutStartSec=180
+Nice=5

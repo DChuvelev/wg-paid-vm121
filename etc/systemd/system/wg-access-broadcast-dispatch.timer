@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll private Admin broadcast SMTP queue
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Persistent=false
+Unit=wg-access-broadcast-dispatch.service
+
+[Install]
+WantedBy=timers.target
