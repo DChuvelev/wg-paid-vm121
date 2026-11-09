@@ -4,6 +4,7 @@ import uuid
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    LargeBinary,
     DateTime,
     ForeignKey,
     Integer,
@@ -532,3 +533,29 @@ class AdminBroadcastRecipient(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_category: Mapped[str | None] = mapped_column(String(40))
+
+
+class AdminDiagnosticJob(Base):
+    __tablename__ = "admin_diagnostic_jobs"
+    __table_args__ = (
+        CheckConstraint("state IN ('queued','running','ready','partial','failed','expired')", name="admin_diagnostic_state_allowed"),
+        CheckConstraint("artifact_size IS NULL OR (artifact_size >= 1 AND artifact_size <= 1048576)", name="admin_diagnostic_size_bounded"),
+        Index("uq_admin_diagnostic_single_active", text("(1)"), unique=True,
+              postgresql_where=text("state IN ('queued','running')"),
+              sqlite_where=text("state IN ('queued','running')")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    artifact: Mapped[bytes | None] = mapped_column(LargeBinary, deferred=True)
+    artifact_size: Mapped[int | None] = mapped_column(Integer)
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64))
+    capture_status: Mapped[str | None] = mapped_column(String(48))
+    error_code: Mapped[str | None] = mapped_column(String(48))

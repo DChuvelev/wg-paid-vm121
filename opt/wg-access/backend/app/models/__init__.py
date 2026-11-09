@@ -1,6 +1,7 @@
 from app.models.core import (
     User,
     AdminBroadcast,
+    AdminDiagnosticJob,
     AdminBroadcastRecipient,
     Plan,
     AccessGrant,
@@ -28,6 +29,7 @@ from app.models.core import (
 __all__ = [
     "User",
     "AdminBroadcast",
+    "AdminDiagnosticJob",
     "AdminBroadcastRecipient",
     "Plan",
     "AccessGrant",
