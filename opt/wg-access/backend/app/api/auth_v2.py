@@ -4730,7 +4730,12 @@ class AdminMonitoringEventsResponse(BaseModel):
     rows: list[AdminMonitoringEventRow]
 
 
-_MONITORING_SELECTORS = ("egress1", "egress2", "egress3", "egress4", "egress5")
+# API labels identify physical egress outputs; stored minute JSONB is keyed by cs selectors.
+# Accepted VM101 topology: egress1/cs4, egress2/cs5, egress3/cs1, egress4/cs2, egress5/cs3.
+_MONITORING_SELECTOR_SOURCE = {
+    "egress1": "cs4", "egress2": "cs5", "egress3": "cs1", "egress4": "cs2", "egress5": "cs3",
+}
+_MONITORING_SELECTORS = tuple(_MONITORING_SELECTOR_SOURCE)
 _MONITORING_FRESHNESS_SECONDS = 180
 
 
@@ -4779,8 +4784,10 @@ def admin_monitoring_summary(
     valid = [r for r in minute_rows if r["coverage_status"] != "unknown"]
     last_sel = (last["selector_peak"] or {}) if last else {}
     # JSONB is already a dict in PostgreSQL, and contains logical slots, not WG/AWG siblings.
-    selector_observed = {s: (int(last_sel[s]) if s in last_sel and last_sel[s] is not None else None)
-                         for s in _MONITORING_SELECTORS}
+    selector_observed = {
+        egress: (int(last_sel[cs]) if cs in last_sel and last_sel[cs] is not None else None)
+        for egress, cs in _MONITORING_SELECTOR_SOURCE.items()
+    }
     activity = AdminMonitoringActivitySummary(
         expected_minutes=expected, observed_minutes=observed,
         complete_minutes=sum(r["coverage_status"] == "complete" for r in minute_rows),
