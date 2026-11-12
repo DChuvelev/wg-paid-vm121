@@ -9,6 +9,7 @@ from app.api.agent import router as agent_router
 from app.api.auth_v2 import router as auth_v2_router
 from app.api.admin_broadcasts import router as admin_broadcast_router
 from app.api.admin_diagnostics import router as admin_diagnostics_router
+from app.api.admin_billing import router as admin_billing_router
 
 app = FastAPI(title="WG Access Backend", version="0.0.4")
 
@@ -18,6 +19,7 @@ app.include_router(agent_router)
 app.include_router(auth_v2_router)
 app.include_router(admin_broadcast_router)
 app.include_router(admin_diagnostics_router)
+app.include_router(admin_billing_router)
 
 
 @app.get("/health")
